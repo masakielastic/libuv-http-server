@@ -1,15 +1,15 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2
-INCLUDES = -I.
+INCLUDES = -Isrc
 LIBS = -luv -lssl -lcrypto
 
 # Source files
-SOURCES = httpserver.c llhttp.c api.c http.c
+SOURCES = src/httpserver.c src/llhttp.c src/api.c src/http.c
 OBJECTS = $(SOURCES:.c=.o)
-HEADERS = httpserver.h llhttp.h
+HEADERS = src/httpserver.h src/llhttp.h
 
 # Test programs
-TEST_SOURCES = test_server.c test_mkcert.c test_http.c test_unified.c
+TEST_SOURCES = tests/test_server.c tests/test_mkcert.c tests/test_http.c tests/test_unified.c
 TEST_OBJECTS = $(TEST_SOURCES:.c=.o)
 TEST_TARGETS = test_server test_mkcert test_http test_unified
 
@@ -24,16 +24,16 @@ $(LIBRARY): $(OBJECTS)
 	ar rcs $@ $^
 
 # Test executables
-test_server: test_server.o $(LIBRARY)
+test_server: tests/test_server.o $(LIBRARY)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-test_mkcert: test_mkcert.o $(LIBRARY)
+test_mkcert: tests/test_mkcert.o $(LIBRARY)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-test_http: test_http.o $(LIBRARY)
+test_http: tests/test_http.o $(LIBRARY)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-test_unified: test_unified.o $(LIBRARY)
+test_unified: tests/test_unified.o $(LIBRARY)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 # Object files
@@ -49,7 +49,7 @@ install: $(LIBRARY)
 	install -d /usr/local/lib
 	install -d /usr/local/include
 	install $(LIBRARY) /usr/local/lib/
-	install httpserver.h /usr/local/include/
+	install src/httpserver.h /usr/local/include/
 
 # Uninstall target (optional)
 uninstall:
