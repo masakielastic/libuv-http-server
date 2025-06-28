@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2
+LLHTTP_CFLAGS = -Wall -Wextra -std=c99 -O2 -Wno-unused-parameter
 INCLUDES = -Isrc
 LIBS = -luv -lssl -lcrypto
 
@@ -30,6 +31,16 @@ test_unified: tests/test_unified.o $(LIBRARY)
 # Object files
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Special rules for llhttp generated files (suppress unused parameter warnings)
+src/llhttp.o: src/llhttp.c $(HEADERS)
+	$(CC) $(LLHTTP_CFLAGS) $(INCLUDES) -c $< -o $@
+
+src/api.o: src/api.c $(HEADERS)
+	$(CC) $(LLHTTP_CFLAGS) $(INCLUDES) -c $< -o $@
+
+src/http.o: src/http.c $(HEADERS)
+	$(CC) $(LLHTTP_CFLAGS) $(INCLUDES) -c $< -o $@
 
 # Clean target
 clean:

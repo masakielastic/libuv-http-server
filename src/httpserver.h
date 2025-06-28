@@ -75,6 +75,9 @@ void http_response_destroy(http_response_t* response);
 #include <stdlib.h>
 #include <string.h>
 
+// Constants
+#define MAX_HEADERS 64
+
 // Internal structures
 struct http_server_s {
     uv_tcp_t tcp;
@@ -100,7 +103,7 @@ struct http_connection_s {
     // Parsed request data
     char* method;
     char* url;
-    char* headers[64][2];  // name-value pairs
+    char* headers[MAX_HEADERS][2];  // name-value pairs
     int header_count;
     char* body;
     size_t body_length;
@@ -120,7 +123,7 @@ struct http_request_s {
 
 struct http_response_s {
     int status_code;
-    char* headers[64][2];  // name-value pairs
+    char* headers[MAX_HEADERS][2];  // name-value pairs
     int header_count;
     char* body;
     size_t body_length;

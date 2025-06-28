@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include "httpserver.h"
 
 #define RESPONSE "Hello from unified API!"

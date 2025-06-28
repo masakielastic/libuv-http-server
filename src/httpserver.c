@@ -88,9 +88,8 @@ static int load_cert_files(SSL_CTX* ctx, const char* cert_file, const char* key_
 }
 
 static int init_ssl(http_server_t* server) {
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
+    // Modern OpenSSL initialization (OpenSSL 1.1.0+)
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 
     server->ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!server->ssl_ctx) {
@@ -98,8 +97,23 @@ static int init_ssl(http_server_t* server) {
         return 0;
     }
 
-    // Security options
-    SSL_CTX_set_options(server->ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+    // Modern security options - disable weak protocols and ciphers
+    SSL_CTX_set_options(server->ssl_ctx, 
+        SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 |
+        SSL_OP_NO_COMPRESSION | SSL_OP_CIPHER_SERVER_PREFERENCE |
+        SSL_OP_SINGLE_DH_USE | SSL_OP_SINGLE_ECDH_USE);
+
+    // Set minimum protocol version to TLS 1.2
+    SSL_CTX_set_min_proto_version(server->ssl_ctx, TLS1_2_VERSION);
+
+    // Set strong cipher suites
+    if (!SSL_CTX_set_cipher_list(server->ssl_ctx, 
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")) {
+        fprintf(stderr, "Failed to set cipher list\n");
+        return 0;
+    }
 
     // Generate self-signed certificate
     if (!generate_self_signed_cert(server->ssl_ctx)) {
@@ -111,9 +125,8 @@ static int init_ssl(http_server_t* server) {
 }
 
 static int init_ssl_with_certs(http_server_t* server, const char* cert_file, const char* key_file) {
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
+    // Modern OpenSSL initialization (OpenSSL 1.1.0+)
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 
     server->ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!server->ssl_ctx) {
@@ -121,8 +134,23 @@ static int init_ssl_with_certs(http_server_t* server, const char* cert_file, con
         return 0;
     }
 
-    // Security options
-    SSL_CTX_set_options(server->ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+    // Modern security options - disable weak protocols and ciphers
+    SSL_CTX_set_options(server->ssl_ctx, 
+        SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 |
+        SSL_OP_NO_COMPRESSION | SSL_OP_CIPHER_SERVER_PREFERENCE |
+        SSL_OP_SINGLE_DH_USE | SSL_OP_SINGLE_ECDH_USE);
+
+    // Set minimum protocol version to TLS 1.2
+    SSL_CTX_set_min_proto_version(server->ssl_ctx, TLS1_2_VERSION);
+
+    // Set strong cipher suites
+    if (!SSL_CTX_set_cipher_list(server->ssl_ctx, 
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")) {
+        fprintf(stderr, "Failed to set cipher list\n");
+        return 0;
+    }
 
     // Load certificates from files
     if (!load_cert_files(server->ssl_ctx, cert_file, key_file)) {
@@ -135,7 +163,12 @@ static int init_ssl_with_certs(http_server_t* server, const char* cert_file, con
 
 // Memory allocation callback
 static void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    (void)handle; // Suppress unused parameter warning
     buf->base = (char*)malloc(suggested_size);
+    if (!buf->base) {
+        buf->len = 0;
+        return;
+    }
     buf->len = suggested_size;
 }
 
@@ -210,12 +243,33 @@ static void flush_tls_data(http_connection_t* conn) {
     int pending = BIO_pending(conn->write_bio);
     
     if (pending > 0) {
-        int bytes = BIO_read(conn->write_bio, buffer, sizeof(buffer));
+        // Ensure we don't read more than buffer size
+        int bytes_to_read = pending > (int)sizeof(buffer) ? (int)sizeof(buffer) : pending;
+        int bytes = BIO_read(conn->write_bio, buffer, bytes_to_read);
+        
         if (bytes > 0) {
             uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
-            uv_buf_t buf = uv_buf_init(malloc(bytes), bytes);
-            memcpy(buf.base, buffer, bytes);
-            uv_write(req, (uv_stream_t*)conn, &buf, 1, on_write);
+            if (!req) {
+                fprintf(stderr, "Failed to allocate write request\n");
+                return;
+            }
+            
+            char* write_buf = malloc(bytes);
+            if (!write_buf) {
+                fprintf(stderr, "Failed to allocate write buffer\n");
+                free(req);
+                return;
+            }
+            
+            memcpy(write_buf, buffer, bytes);
+            uv_buf_t buf = uv_buf_init(write_buf, bytes);
+            
+            int result = uv_write(req, (uv_stream_t*)conn, &buf, 1, on_write);
+            if (result != 0) {
+                fprintf(stderr, "uv_write failed in flush_tls_data: %s\n", uv_strerror(result));
+                free(req);
+                free(write_buf);
+            }
         }
     }
 }
@@ -249,6 +303,10 @@ static int on_url(llhttp_t* parser, const char* at, size_t length) {
     
     if (!conn->url) {
         conn->url = malloc(length + 1);
+        if (!conn->url) {
+            fprintf(stderr, "Failed to allocate memory for URL\n");
+            return -1;
+        }
         memcpy(conn->url, at, length);
         conn->url[length] = '\0';
     }
@@ -259,11 +317,19 @@ static int on_url(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
     http_connection_t* conn = (http_connection_t*)parser->data;
     
-    if (conn->header_count < 64) {
-        conn->headers[conn->header_count][0] = malloc(length + 1);
-        memcpy(conn->headers[conn->header_count][0], at, length);
-        conn->headers[conn->header_count][0][length] = '\0';
+    if (conn->header_count >= MAX_HEADERS) {
+        fprintf(stderr, "Maximum number of headers exceeded (%d)\n", MAX_HEADERS);
+        return -1;
     }
+    
+    conn->headers[conn->header_count][0] = malloc(length + 1);
+    if (!conn->headers[conn->header_count][0]) {
+        fprintf(stderr, "Failed to allocate memory for header field\n");
+        return -1;
+    }
+    
+    memcpy(conn->headers[conn->header_count][0], at, length);
+    conn->headers[conn->header_count][0][length] = '\0';
     
     return 0;
 }
@@ -271,12 +337,20 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
 static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
     http_connection_t* conn = (http_connection_t*)parser->data;
     
-    if (conn->header_count < 64) {
-        conn->headers[conn->header_count][1] = malloc(length + 1);
-        memcpy(conn->headers[conn->header_count][1], at, length);
-        conn->headers[conn->header_count][1][length] = '\0';
-        conn->header_count++;
+    if (conn->header_count >= MAX_HEADERS) {
+        fprintf(stderr, "Maximum number of headers exceeded (%d)\n", MAX_HEADERS);
+        return -1;
     }
+    
+    conn->headers[conn->header_count][1] = malloc(length + 1);
+    if (!conn->headers[conn->header_count][1]) {
+        fprintf(stderr, "Failed to allocate memory for header value\n");
+        return -1;
+    }
+    
+    memcpy(conn->headers[conn->header_count][1], at, length);
+    conn->headers[conn->header_count][1][length] = '\0';
+    conn->header_count++;
     
     return 0;
 }
@@ -297,8 +371,14 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
     http_connection_t* conn = (http_connection_t*)parser->data;
     
     if (conn->body_length + length > conn->body_capacity) {
-        conn->body_capacity = (conn->body_length + length) * 2;
-        conn->body = realloc(conn->body, conn->body_capacity);
+        size_t new_capacity = (conn->body_length + length) * 2;
+        char* new_body = realloc(conn->body, new_capacity);
+        if (!new_body) {
+            fprintf(stderr, "Failed to reallocate memory for request body\n");
+            return -1;
+        }
+        conn->body = new_body;
+        conn->body_capacity = new_capacity;
     }
     
     memcpy(conn->body + conn->body_length, at, length);
@@ -313,8 +393,14 @@ static int on_message_complete(llhttp_t* parser) {
     // Null-terminate body if it exists
     if (conn->body) {
         if (conn->body_length >= conn->body_capacity) {
-            conn->body_capacity++;
-            conn->body = realloc(conn->body, conn->body_capacity);
+            size_t new_capacity = conn->body_capacity + 1;
+            char* new_body = realloc(conn->body, new_capacity);
+            if (!new_body) {
+                fprintf(stderr, "Failed to reallocate memory for null terminator\n");
+                return -1;
+            }
+            conn->body = new_body;
+            conn->body_capacity = new_capacity;
         }
         conn->body[conn->body_length] = '\0';
     }
@@ -418,6 +504,10 @@ static void on_new_connection(uv_stream_t* server, int status) {
 
     http_server_t* http_server = (http_server_t*)server->data;
     http_connection_t* conn = (http_connection_t*)malloc(sizeof(http_connection_t));
+    if (!conn) {
+        fprintf(stderr, "Failed to allocate memory for connection\n");
+        return;
+    }
     memset(conn, 0, sizeof(http_connection_t));
     
     conn->server = http_server;
@@ -515,7 +605,10 @@ http_server_t* http_server_create(const http_server_config_t* config) {
     }
     
     http_server_t* server = malloc(sizeof(http_server_t));
-    if (!server) return NULL;
+    if (!server) {
+        fprintf(stderr, "Failed to allocate memory for server\n");
+        return NULL;
+    }
     
     memset(server, 0, sizeof(http_server_t));
     server->port = config->port;
@@ -614,7 +707,10 @@ size_t http_request_body_length(http_request_t* request) {
 // Response API
 http_response_t* http_response_init(void) {
     http_response_t* response = malloc(sizeof(http_response_t));
-    if (!response) return NULL;
+    if (!response) {
+        fprintf(stderr, "Failed to allocate memory for response\n");
+        return NULL;
+    }
     
     memset(response, 0, sizeof(http_response_t));
     response->status_code = 200;
@@ -629,10 +725,27 @@ void http_response_status(http_response_t* response, int status) {
 }
 
 void http_response_header(http_response_t* response, const char* name, const char* value) {
-    if (!response || !name || !value || response->header_count >= 64) return;
+    if (!response || !name || !value) return;
+    
+    if (response->header_count >= MAX_HEADERS) {
+        fprintf(stderr, "Maximum number of response headers exceeded (%d)\n", MAX_HEADERS);
+        return;
+    }
     
     response->headers[response->header_count][0] = strdup(name);
+    if (!response->headers[response->header_count][0]) {
+        fprintf(stderr, "Failed to allocate memory for response header name\n");
+        return;
+    }
+    
     response->headers[response->header_count][1] = strdup(value);
+    if (!response->headers[response->header_count][1]) {
+        fprintf(stderr, "Failed to allocate memory for response header value\n");
+        free(response->headers[response->header_count][0]);
+        response->headers[response->header_count][0] = NULL;
+        return;
+    }
+    
     response->header_count++;
 }
 
@@ -641,6 +754,11 @@ void http_response_body(http_response_t* response, const char* body, size_t leng
     
     free(response->body);
     response->body = malloc(length + 1);
+    if (!response->body) {
+        fprintf(stderr, "Failed to allocate memory for response body\n");
+        response->body_length = 0;
+        return;
+    }
     memcpy(response->body, body, length);
     response->body[length] = '\0';
     response->body_length = length;
@@ -651,34 +769,105 @@ int http_respond(http_request_t* request, http_response_t* response) {
     
     http_connection_t* conn = request->connection;
     
-    // Build HTTP response
-    char* response_buf = malloc(8192);
-    int offset = 0;
+    // Calculate required buffer size dynamically
+    size_t required_size = 0;
     
-    // Status line
-    offset += snprintf(response_buf + offset, 8192 - offset, 
-                      "HTTP/1.1 %d OK\r\n", response->status_code);
+    // Status line (HTTP/1.1 XXX OK\r\n)
+    required_size += 64; // Conservative estimate for status line
     
     // Headers
     for (int i = 0; i < response->header_count; i++) {
-        offset += snprintf(response_buf + offset, 8192 - offset,
-                          "%s: %s\r\n", response->headers[i][0], response->headers[i][1]);
+        if (response->headers[i][0] && response->headers[i][1]) {
+            required_size += strlen(response->headers[i][0]) + strlen(response->headers[i][1]) + 4; // ": \r\n"
+        }
     }
     
     // Content-Length header
     if (response->body) {
-        offset += snprintf(response_buf + offset, 8192 - offset,
-                          "Content-Length: %zu\r\n", response->body_length);
+        required_size += 64; // "Content-Length: XXXXXX\r\n"
     }
     
-    // Connection close
-    offset += snprintf(response_buf + offset, 8192 - offset, "Connection: close\r\n");
-    
-    // End headers
-    offset += snprintf(response_buf + offset, 8192 - offset, "\r\n");
+    // Connection close and end headers
+    required_size += 32; // "Connection: close\r\n\r\n"
     
     // Body
     if (response->body) {
+        required_size += response->body_length;
+    }
+    
+    // Add safety margin
+    required_size += 256;
+    
+    // Allocate dynamic buffer
+    char* response_buf = malloc(required_size);
+    if (!response_buf) {
+        fprintf(stderr, "Failed to allocate response buffer of size %zu\n", required_size);
+        return -1;
+    }
+    
+    int offset = 0;
+    size_t remaining = required_size;
+    
+    // Status line
+    int written = snprintf(response_buf + offset, remaining, 
+                          "HTTP/1.1 %d OK\r\n", response->status_code);
+    if (written >= (int)remaining) {
+        free(response_buf);
+        return -1;
+    }
+    offset += written;
+    remaining -= written;
+    
+    // Headers
+    for (int i = 0; i < response->header_count; i++) {
+        if (response->headers[i][0] && response->headers[i][1]) {
+            written = snprintf(response_buf + offset, remaining,
+                              "%s: %s\r\n", response->headers[i][0], response->headers[i][1]);
+            if (written >= (int)remaining) {
+                free(response_buf);
+                return -1;
+            }
+            offset += written;
+            remaining -= written;
+        }
+    }
+    
+    // Content-Length header
+    if (response->body) {
+        written = snprintf(response_buf + offset, remaining,
+                          "Content-Length: %zu\r\n", response->body_length);
+        if (written >= (int)remaining) {
+            free(response_buf);
+            return -1;
+        }
+        offset += written;
+        remaining -= written;
+    }
+    
+    // Connection close
+    written = snprintf(response_buf + offset, remaining, "Connection: close\r\n");
+    if (written >= (int)remaining) {
+        free(response_buf);
+        return -1;
+    }
+    offset += written;
+    remaining -= written;
+    
+    // End headers
+    written = snprintf(response_buf + offset, remaining, "\r\n");
+    if (written >= (int)remaining) {
+        free(response_buf);
+        return -1;
+    }
+    offset += written;
+    remaining -= written;
+    
+    // Body
+    if (response->body) {
+        if (response->body_length >= remaining) {
+            free(response_buf);
+            return -1;
+        }
         memcpy(response_buf + offset, response->body, response->body_length);
         offset += response->body_length;
     }
@@ -702,6 +891,12 @@ int http_respond(http_request_t* request, http_response_t* response) {
     } else {
         // Send response directly via TCP
         uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
+        if (!req) {
+            fprintf(stderr, "Failed to allocate write request\n");
+            free(response_buf);
+            return -1;
+        }
+        
         uv_buf_t buf = uv_buf_init(response_buf, offset);
         
         int result = uv_write(req, (uv_stream_t*)conn, &buf, 1, on_write);
