@@ -474,22 +474,6 @@ static void on_new_connection(uv_stream_t* server, int status) {
     }
 }
 
-// Legacy compatibility wrapper functions
-http_server_t* http_server_init(int port, http_request_handler_t handler) {
-    http_server_config_t config = http_server_config_default(port, handler);
-    return http_server_create(&config);
-}
-
-http_server_t* http_server_init_with_certs(int port, http_request_handler_t handler, 
-                                          const char* cert_file, const char* key_file) {
-    http_server_config_t config = http_server_config_https(port, handler, cert_file, key_file);
-    return http_server_create(&config);
-}
-
-http_server_t* http_server_init_http(int port, http_request_handler_t handler) {
-    http_server_config_t config = http_server_config_http(port, handler);
-    return http_server_create(&config);
-}
 
 // Helper functions for configuration
 http_server_config_t http_server_config_default(int port, http_request_handler_t handler) {

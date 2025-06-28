@@ -40,11 +40,6 @@ http_server_t* http_server_create(const http_server_config_t* config);
 int http_server_listen(http_server_t* server);
 void http_server_destroy(http_server_t* server);
 
-// Legacy compatibility functions (deprecated but still available)
-http_server_t* http_server_init(int port, http_request_handler_t handler);
-http_server_t* http_server_init_with_certs(int port, http_request_handler_t handler, 
-                                          const char* cert_file, const char* key_file);
-http_server_t* http_server_init_http(int port, http_request_handler_t handler);
 
 // Helper functions for configuration
 http_server_config_t http_server_config_default(int port, http_request_handler_t handler);

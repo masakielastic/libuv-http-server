@@ -9,9 +9,9 @@ OBJECTS = $(SOURCES:.c=.o)
 HEADERS = src/httpserver.h src/llhttp.h
 
 # Test programs
-TEST_SOURCES = tests/test_server.c tests/test_mkcert.c tests/test_http.c tests/test_unified.c
+TEST_SOURCES = tests/test_unified.c
 TEST_OBJECTS = $(TEST_SOURCES:.c=.o)
-TEST_TARGETS = test_server test_mkcert test_http test_unified
+TEST_TARGETS = test_unified
 
 # Library
 LIBRARY = libhttpserver.a
@@ -24,15 +24,6 @@ $(LIBRARY): $(OBJECTS)
 	ar rcs $@ $^
 
 # Test executables
-test_server: tests/test_server.o $(LIBRARY)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
-
-test_mkcert: tests/test_mkcert.o $(LIBRARY)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
-
-test_http: tests/test_http.o $(LIBRARY)
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
-
 test_unified: tests/test_unified.o $(LIBRARY)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
@@ -57,8 +48,8 @@ uninstall:
 	rm -f /usr/local/include/httpserver.h
 
 # Test target
-test: test_server
-	./test_server
+test: test_unified
+	./test_unified
 
 # Debug build
 debug: CFLAGS += -g -DDEBUG

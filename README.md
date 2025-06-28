@@ -108,23 +108,6 @@ http_server_config_t config = http_server_config_https(
 http_server_t* server = http_server_create(&config);
 ```
 
-### レガシーAPI（互換性維持）
-
-既存のhttpserver.hコードはそのまま動作します：
-
-```c
-// HTTPS（自己署名）
-struct http_server_s* server = http_server_init(8443, handle_request);
-
-// HTTPS（独自証明書）
-struct http_server_s* server = http_server_init_with_certs(
-    8443, handle_request, "cert.pem", "key.pem");
-
-// HTTP
-struct http_server_s* server = http_server_init_http(8080, handle_request);
-
-http_server_listen(server);
-```
 
 ## API リファレンス
 
@@ -191,35 +174,20 @@ mkcert localhost 127.0.0.1 ::1
 curl https://localhost:8443
 ```
 
-### 個別テスト
-```bash
-# 従来API HTTPS（自己署名）
-./test_server
-curl -k https://localhost:8443
-
-# mkcert証明書テスト
-./test_mkcert localhost+2.pem localhost+2-key.pem
-curl https://localhost:8443
-
-# 平文HTTPテスト
-./test_http
-curl http://localhost:8080
-```
 
 ## プロジェクト構造
 
 ```
-├── httpserver.h         # メインヘッダーファイル
-├── httpserver.c         # メイン実装
-├── llhttp.h            # llhttpパーサーヘッダー
-├── llhttp.c            # llhttpパーサー実装
-├── api.c               # llhttp API実装
-├── http.c              # llhttp HTTP処理
+├── src/
+│   ├── httpserver.h    # メインヘッダーファイル
+│   ├── httpserver.c    # メイン実装
+│   ├── llhttp.h        # llhttpパーサーヘッダー
+│   ├── llhttp.c        # llhttpパーサー実装
+│   ├── api.c           # llhttp API実装
+│   └── http.c          # llhttp HTTP処理
+├── tests/
+│   └── test_unified.c  # 統合APIテスト
 ├── Makefile            # ビルド設定
-├── test_unified.c      # 統合APIテスト
-├── test_server.c       # 従来APIテスト（HTTPS）
-├── test_mkcert.c       # mkcert証明書テスト
-├── test_http.c         # HTTPテスト
 └── README.md           # このファイル
 ```
 
