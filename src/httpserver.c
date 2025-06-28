@@ -8,29 +8,308 @@
 // Forward declaration for internal connection structure
 typedef struct http_connection_s http_connection_t;
 
-// SSL initialization functions (from libuv-tls-server-sample.c)
-static int generate_self_signed_cert(SSL_CTX* ctx) {
-    EVP_PKEY* pkey = NULL;
-    X509* x509 = NULL;
-    EVP_PKEY_CTX* pkey_ctx = NULL;
-    X509_NAME* name = NULL;
-    int ret = 0;
+// Cleanup function declarations
+void cleanup_ssl_ctx(SSL_CTX** ptr);
+void cleanup_ssl(SSL** ptr);
+void cleanup_bio(BIO** ptr);
+void cleanup_evp_pkey_ctx(EVP_PKEY_CTX** ptr);
+void cleanup_evp_pkey(EVP_PKEY** ptr);
+void cleanup_x509(X509** ptr);
+void cleanup_memory(void** ptr);
+void cleanup_http_connection(http_connection_t** ptr);
+
+// Cleanup function definitions
+void cleanup_ssl_ctx(SSL_CTX** ptr) { if (ptr && *ptr) { SSL_CTX_free(*ptr); *ptr = NULL; } }
+void cleanup_ssl(SSL** ptr) { if (ptr && *ptr) { SSL_free(*ptr); *ptr = NULL; } }
+void cleanup_bio(BIO** ptr) { if (ptr && *ptr) { BIO_free(*ptr); *ptr = NULL; } }
+void cleanup_evp_pkey_ctx(EVP_PKEY_CTX** ptr) { if (ptr && *ptr) { EVP_PKEY_CTX_free(*ptr); *ptr = NULL; } }
+void cleanup_evp_pkey(EVP_PKEY** ptr) { if (ptr && *ptr) { EVP_PKEY_free(*ptr); *ptr = NULL; } }
+void cleanup_x509(X509** ptr) { if (ptr && *ptr) { X509_free(*ptr); *ptr = NULL; } }
+void cleanup_memory(void** ptr) { if (ptr && *ptr) { free(*ptr); *ptr = NULL; } }
+void cleanup_http_connection(http_connection_t** ptr) { if (ptr && *ptr) { free(*ptr); *ptr = NULL; } }
+
+// Memory pool implementation
+http_server_error_t memory_pool_init(memory_pool_t* pool, size_t block_size, size_t block_count) {
+    HTTP_CHECK_PARAM(pool && block_size > 0 && block_count > 0, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    memset(pool, 0, sizeof(memory_pool_t));
+    pool->block_size = block_size;
+    pool->block_count = block_count;
+    pool->free_count = block_count;
+    
+    if (pthread_mutex_init(&pool->mutex, NULL) != 0) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to initialize pool mutex");
+    }
+    
+    // Allocate block array
+    pool->blocks = calloc(block_count, sizeof(memory_block_t));
+    if (!pool->blocks) {
+        pthread_mutex_destroy(&pool->mutex);
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to allocate block array");
+    }
+    
+    // Allocate memory blocks and initialize linked list
+    for (size_t i = 0; i < block_count; i++) {
+        pool->blocks[i].ptr = malloc(block_size);
+        if (!pool->blocks[i].ptr) {
+            // Cleanup already allocated blocks
+            for (size_t j = 0; j < i; j++) {
+                free(pool->blocks[j].ptr);
+            }
+            free(pool->blocks);
+            pthread_mutex_destroy(&pool->mutex);
+            HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to allocate memory block %zu", i);
+        }
+        
+        pool->blocks[i].size = block_size;
+        pool->blocks[i].in_use = 0;
+        pool->blocks[i].next = (i < block_count - 1) ? &pool->blocks[i + 1] : NULL;
+    }
+    
+    HTTP_LOG_INFO("Memory pool initialized: %zu blocks of %zu bytes each", block_count, block_size);
+    return HTTP_SERVER_SUCCESS;
+}
+
+void memory_pool_destroy(memory_pool_t* pool) {
+    if (!pool || !pool->blocks) return;
+    
+    pthread_mutex_lock(&pool->mutex);
+    
+    for (size_t i = 0; i < pool->block_count; i++) {
+        if (pool->blocks[i].ptr) {
+            free(pool->blocks[i].ptr);
+        }
+    }
+    
+    free(pool->blocks);
+    pool->blocks = NULL;
+    
+    pthread_mutex_unlock(&pool->mutex);
+    pthread_mutex_destroy(&pool->mutex);
+    
+    HTTP_LOG_INFO("Memory pool destroyed: %zu/%zu blocks were in use", 
+                  pool->allocated_count, pool->block_count);
+}
+
+void* memory_pool_alloc(memory_pool_t* pool) {
+    if (!pool || !pool->blocks) return NULL;
+    
+    pthread_mutex_lock(&pool->mutex);
+    
+    // Find first free block
+    for (size_t i = 0; i < pool->block_count; i++) {
+        if (!pool->blocks[i].in_use) {
+            pool->blocks[i].in_use = 1;
+            pool->allocated_count++;
+            pool->free_count--;
+            
+            void* ptr = pool->blocks[i].ptr;
+            pthread_mutex_unlock(&pool->mutex);
+            return ptr;
+        }
+    }
+    
+    pthread_mutex_unlock(&pool->mutex);
+    return NULL; // Pool exhausted
+}
+
+void memory_pool_free(memory_pool_t* pool, void* ptr) {
+    if (!pool || !pool->blocks || !ptr) return;
+    
+    pthread_mutex_lock(&pool->mutex);
+    
+    // Find the block containing this pointer
+    for (size_t i = 0; i < pool->block_count; i++) {
+        if (pool->blocks[i].ptr == ptr && pool->blocks[i].in_use) {
+            pool->blocks[i].in_use = 0;
+            pool->allocated_count--;
+            pool->free_count++;
+            
+            // Clear the memory for security
+            memset(ptr, 0, pool->blocks[i].size);
+            
+            pthread_mutex_unlock(&pool->mutex);
+            return;
+        }
+    }
+    
+    pthread_mutex_unlock(&pool->mutex);
+    HTTP_LOG_WARN("Attempted to free pointer not in pool: %p", ptr);
+}
+
+// Memory statistics functions
+void memory_stats_update_alloc(memory_stats_t* stats, size_t size) {
+    if (!stats) return;
+    
+    stats->total_allocated += size;
+    stats->current_usage += size;
+    
+    if (stats->current_usage > stats->peak_usage) {
+        stats->peak_usage = stats->current_usage;
+    }
+}
+
+void memory_stats_update_free(memory_stats_t* stats, size_t size) {
+    if (!stats) return;
+    
+    stats->total_freed += size;
+    if (stats->current_usage >= size) {
+        stats->current_usage -= size;
+    }
+}
+
+void memory_stats_log(const memory_stats_t* stats) {
+    if (!stats) return;
+    
+    HTTP_LOG_INFO("Memory Statistics:");
+    HTTP_LOG_INFO("  Total allocated: %zu bytes", stats->total_allocated);
+    HTTP_LOG_INFO("  Total freed: %zu bytes", stats->total_freed);
+    HTTP_LOG_INFO("  Current usage: %zu bytes", stats->current_usage);
+    HTTP_LOG_INFO("  Peak usage: %zu bytes", stats->peak_usage);
+    HTTP_LOG_INFO("  Pool hits: %zu", stats->pool_hits);
+    HTTP_LOG_INFO("  Pool misses: %zu", stats->pool_misses);
+    if (stats->pool_hits + stats->pool_misses > 0) {
+        double hit_rate = (double)stats->pool_hits / (stats->pool_hits + stats->pool_misses) * 100.0;
+        HTTP_LOG_INFO("  Pool hit rate: %.2f%%", hit_rate);
+    }
+}
+
+// Smart memory management functions
+void* http_malloc(http_server_t* server, size_t size) {
+    if (!server || size == 0) return NULL;
+    
+    void* ptr = NULL;
+    
+    // Try to use appropriate pool based on size
+    if (size <= MEMORY_POOL_SMALL_SIZE) {
+        ptr = memory_pool_alloc(&server->small_pool);
+        if (ptr) {
+            server->memory_stats.pool_hits++;
+            memory_stats_update_alloc(&server->memory_stats, MEMORY_POOL_SMALL_SIZE);
+            return ptr;
+        }
+    } else if (size <= MEMORY_POOL_MEDIUM_SIZE) {
+        ptr = memory_pool_alloc(&server->medium_pool);
+        if (ptr) {
+            server->memory_stats.pool_hits++;
+            memory_stats_update_alloc(&server->memory_stats, MEMORY_POOL_MEDIUM_SIZE);
+            return ptr;
+        }
+    } else if (size <= MEMORY_POOL_LARGE_SIZE) {
+        ptr = memory_pool_alloc(&server->large_pool);
+        if (ptr) {
+            server->memory_stats.pool_hits++;
+            memory_stats_update_alloc(&server->memory_stats, MEMORY_POOL_LARGE_SIZE);
+            return ptr;
+        }
+    }
+    
+    // Pool allocation failed or size too large, fall back to malloc
+    ptr = malloc(size);
+    if (ptr) {
+        server->memory_stats.pool_misses++;
+        memory_stats_update_alloc(&server->memory_stats, size);
+    }
+    
+    return ptr;
+}
+
+void* http_realloc(http_server_t* server, void* ptr, size_t old_size, size_t new_size) {
+    if (!server) return realloc(ptr, new_size);
+    
+    // If growing within same pool category, try to get new block and copy
+    if (ptr && old_size <= MEMORY_POOL_LARGE_SIZE && new_size <= MEMORY_POOL_LARGE_SIZE) {
+        void* new_ptr = http_malloc(server, new_size);
+        if (new_ptr) {
+            memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
+            http_free(server, ptr, old_size);
+            return new_ptr;
+        }
+    }
+    
+    // Fall back to system realloc
+    void* new_ptr = realloc(ptr, new_size);
+    if (new_ptr && ptr) {
+        // Update statistics for realloc
+        memory_stats_update_free(&server->memory_stats, old_size);
+        memory_stats_update_alloc(&server->memory_stats, new_size);
+        server->memory_stats.pool_misses++;
+    }
+    
+    return new_ptr;
+}
+
+void http_free(http_server_t* server, void* ptr, size_t size) {
+    if (!server || !ptr) return;
+    
+    // Try pool-based free first
+    if (size <= MEMORY_POOL_SMALL_SIZE) {
+        memory_pool_free(&server->small_pool, ptr);
+        memory_stats_update_free(&server->memory_stats, MEMORY_POOL_SMALL_SIZE);
+        return;
+    } else if (size <= MEMORY_POOL_MEDIUM_SIZE) {
+        memory_pool_free(&server->medium_pool, ptr);
+        memory_stats_update_free(&server->memory_stats, MEMORY_POOL_MEDIUM_SIZE);
+        return;
+    } else if (size <= MEMORY_POOL_LARGE_SIZE) {
+        memory_pool_free(&server->large_pool, ptr);
+        memory_stats_update_free(&server->memory_stats, MEMORY_POOL_LARGE_SIZE);
+        return;
+    }
+    
+    // Fall back to system free
+    free(ptr);
+    memory_stats_update_free(&server->memory_stats, size);
+}
+
+char* http_strdup(http_server_t* server, const char* str) {
+    if (!server || !str) return NULL;
+    
+    size_t len = strlen(str);
+    char* dup = http_malloc(server, len + 1);
+    if (dup) {
+        memcpy(dup, str, len + 1);
+    }
+    
+    return dup;
+}
+
+// SSL initialization functions with improved error handling
+static http_server_error_t generate_self_signed_cert(SSL_CTX* ctx) {
+    HTTP_CHECK_PARAM(ctx, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    EVP_PKEY_CTX* pkey_ctx __attribute__((cleanup(cleanup_evp_pkey_ctx))) = NULL;
+    EVP_PKEY* pkey __attribute__((cleanup(cleanup_evp_pkey))) = NULL;
+    X509* x509 __attribute__((cleanup(cleanup_x509))) = NULL;
 
     // Generate RSA key pair
     pkey_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-    if (!pkey_ctx) goto cleanup;
+    if (!pkey_ctx) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to create EVP_PKEY_CTX");
+    }
     
-    if (EVP_PKEY_keygen_init(pkey_ctx) <= 0) goto cleanup;
-    if (EVP_PKEY_CTX_set_rsa_keygen_bits(pkey_ctx, 2048) <= 0) goto cleanup;
+    if (EVP_PKEY_keygen_init(pkey_ctx) <= 0) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to initialize key generation");
+    }
+    
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(pkey_ctx, 2048) <= 0) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to set RSA key size to 2048 bits");
+    }
     
     pkey = EVP_PKEY_new();
-    if (!pkey) goto cleanup;
+    if (!pkey) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to create EVP_PKEY");
+    }
     
-    if (EVP_PKEY_keygen(pkey_ctx, &pkey) <= 0) goto cleanup;
+    if (EVP_PKEY_keygen(pkey_ctx, &pkey) <= 0) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to generate RSA key pair");
+    }
 
     // Create X.509 certificate
     x509 = X509_new();
-    if (!x509) goto cleanup;
+    if (!x509) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to create X509 certificate");
+    }
 
     X509_set_version(x509, 2);
     ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
@@ -39,62 +318,69 @@ static int generate_self_signed_cert(SSL_CTX* ctx) {
 
     X509_set_pubkey(x509, pkey);
 
-    name = X509_get_subject_name(x509);
+    X509_NAME* name = X509_get_subject_name(x509);
     X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (unsigned char*)"JP", -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (unsigned char*)"Test", -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char*)"localhost", -1, -1, 0);
 
     X509_set_issuer_name(x509, name);
 
-    if (!X509_sign(x509, pkey, EVP_sha256())) goto cleanup;
+    if (!X509_sign(x509, pkey, EVP_sha256())) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to sign X509 certificate");
+    }
 
     // Set in SSL_CTX
-    if (SSL_CTX_use_certificate(ctx, x509) != 1) goto cleanup;
-    if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) goto cleanup;
+    if (SSL_CTX_use_certificate(ctx, x509) != 1) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to set certificate in SSL context");
+    }
+    
+    if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to set private key in SSL context");
+    }
 
-    ret = 1;
-
-cleanup:
-    if (pkey_ctx) EVP_PKEY_CTX_free(pkey_ctx);
-    if (pkey) EVP_PKEY_free(pkey);
-    if (x509) X509_free(x509);
-    return ret;
+    HTTP_LOG_INFO("Self-signed certificate generated successfully");
+    return HTTP_SERVER_SUCCESS;
 }
 
-// Load certificates from files
-static int load_cert_files(SSL_CTX* ctx, const char* cert_file, const char* key_file) {
+// Load certificates from files with improved error handling
+static http_server_error_t load_cert_files(SSL_CTX* ctx, const char* cert_file, const char* key_file) {
+    HTTP_CHECK_PARAM(ctx && cert_file && key_file, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
     // Load certificate file
     if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) != 1) {
-        fprintf(stderr, "Failed to load certificate file: %s\n", cert_file);
         ERR_print_errors_fp(stderr);
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_CERT_LOAD, 
+                         "Failed to load certificate file: %s", cert_file);
     }
     
     // Load private key file
     if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) != 1) {
-        fprintf(stderr, "Failed to load private key file: %s\n", key_file);
         ERR_print_errors_fp(stderr);
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_CERT_LOAD,
+                         "Failed to load private key file: %s", key_file);
     }
     
     // Verify that private key matches certificate
     if (SSL_CTX_check_private_key(ctx) != 1) {
-        fprintf(stderr, "Private key does not match certificate\n");
         ERR_print_errors_fp(stderr);
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_CERT_LOAD,
+                         "Private key does not match certificate");
     }
     
-    return 1;
+    HTTP_LOG_INFO("Certificate files loaded successfully: cert=%s, key=%s", cert_file, key_file);
+    return HTTP_SERVER_SUCCESS;
 }
 
-static int init_ssl(http_server_t* server) {
+static http_server_error_t init_ssl(http_server_t* server) {
+    HTTP_CHECK_PARAM(server, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
     // Modern OpenSSL initialization (OpenSSL 1.1.0+)
     OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 
     server->ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!server->ssl_ctx) {
         ERR_print_errors_fp(stderr);
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to create SSL context");
     }
 
     // Modern security options - disable weak protocols and ciphers
@@ -111,27 +397,29 @@ static int init_ssl(http_server_t* server) {
         "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
         "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
         "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")) {
-        fprintf(stderr, "Failed to set cipher list\n");
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to set cipher list");
     }
 
     // Generate self-signed certificate
-    if (!generate_self_signed_cert(server->ssl_ctx)) {
-        fprintf(stderr, "Failed to generate self-signed certificate\n");
-        return 0;
+    http_server_error_t cert_result = generate_self_signed_cert(server->ssl_ctx);
+    if (cert_result != HTTP_SERVER_SUCCESS) {
+        return cert_result;
     }
 
-    return 1;
+    HTTP_LOG_INFO("SSL context initialized successfully with self-signed certificate");
+    return HTTP_SERVER_SUCCESS;
 }
 
-static int init_ssl_with_certs(http_server_t* server, const char* cert_file, const char* key_file) {
+static http_server_error_t init_ssl_with_certs(http_server_t* server, const char* cert_file, const char* key_file) {
+    HTTP_CHECK_PARAM(server && cert_file && key_file, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
     // Modern OpenSSL initialization (OpenSSL 1.1.0+)
     OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 
     server->ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!server->ssl_ctx) {
         ERR_print_errors_fp(stderr);
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to create SSL context");
     }
 
     // Modern security options - disable weak protocols and ciphers
@@ -148,23 +436,24 @@ static int init_ssl_with_certs(http_server_t* server, const char* cert_file, con
         "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
         "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
         "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")) {
-        fprintf(stderr, "Failed to set cipher list\n");
-        return 0;
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_SSL_INIT, "Failed to set cipher list");
     }
 
     // Load certificates from files
-    if (!load_cert_files(server->ssl_ctx, cert_file, key_file)) {
-        fprintf(stderr, "Failed to load certificate files\n");
-        return 0;
+    http_server_error_t cert_result = load_cert_files(server->ssl_ctx, cert_file, key_file);
+    if (cert_result != HTTP_SERVER_SUCCESS) {
+        return cert_result;
     }
 
-    return 1;
+    HTTP_LOG_INFO("SSL context initialized successfully with custom certificates");
+    return HTTP_SERVER_SUCCESS;
 }
 
 // Memory allocation callback
 static void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-    (void)handle; // Suppress unused parameter warning
-    buf->base = (char*)malloc(suggested_size);
+    http_connection_t* conn = (http_connection_t*)handle;
+    
+    buf->base = (char*)http_malloc(conn->server, suggested_size);
     if (!buf->base) {
         buf->len = 0;
         return;
@@ -175,47 +464,107 @@ static void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* b
 // Connection cleanup
 static void free_connection(uv_handle_t* handle) {
     http_connection_t* conn = (http_connection_t*)handle;
+    if (!conn) return;
+    
+    http_server_t* server = conn->server;
     
     if (conn->ssl) {
         SSL_free(conn->ssl);
     }
     
-    // Free parsed request data
-    free(conn->method);
-    free(conn->url);
-    free(conn->body);
-    
-    for (int i = 0; i < conn->header_count; i++) {
-        free(conn->headers[i][0]);
-        free(conn->headers[i][1]);
+    // Free parsed request data using pool-aware functions
+    if (conn->method) {
+        size_t method_size = strlen(conn->method) + 1;
+        http_free(server, conn->method, method_size);
+        conn->method = NULL;
     }
+    
+    if (conn->url) {
+        size_t url_size = strlen(conn->url) + 1;
+        http_free(server, conn->url, url_size);
+        conn->url = NULL;
+    }
+    
+    if (conn->body) {
+        http_free(server, conn->body, conn->body_capacity);
+        conn->body = NULL;
+        conn->body_capacity = 0;
+        conn->body_length = 0;
+    }
+    
+    // Free headers using pool-aware functions
+    for (int i = 0; i < conn->header_count; i++) {
+        if (conn->headers[i][0]) {
+            size_t name_size = strlen(conn->headers[i][0]) + 1;
+            http_free(server, conn->headers[i][0], name_size);
+            conn->headers[i][0] = NULL;
+        }
+        if (conn->headers[i][1]) {
+            size_t value_size = strlen(conn->headers[i][1]) + 1;
+            http_free(server, conn->headers[i][1], value_size);
+            conn->headers[i][1] = NULL;
+        }
+    }
+    conn->header_count = 0;
     
     if (conn->pending_response) {
         http_response_destroy(conn->pending_response);
+        conn->pending_response = NULL;
     }
     
-    free(conn);
+    // Try to free connection back to pool first
+    memory_pool_free(&server->connection_pool, conn);
 }
 
-// TLS handshake handling
-static int handle_tls_handshake(http_connection_t* conn) {
+// TLS handshake handling with improved error reporting
+static http_server_error_t handle_tls_handshake(http_connection_t* conn) {
+    HTTP_CHECK_PARAM(conn && conn->ssl, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
     int result = SSL_do_handshake(conn->ssl);
     
     if (result == 1) {
         if (!conn->handshake_complete) {
             conn->handshake_complete = 1;
-            printf("TLS handshake completed successfully\n");
+            HTTP_LOG_INFO("TLS handshake completed successfully");
         }
-        return 1;
+        return HTTP_SERVER_SUCCESS;
     } else {
         int ssl_error = SSL_get_error(conn->ssl, result);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            return 0; // Continue handshake
-        } else {
-            char err_buf[256];
-            ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            fprintf(stderr, "TLS handshake failed: %s\n", err_buf);
-            return -1;
+        switch (ssl_error) {
+            case SSL_ERROR_WANT_READ:
+                HTTP_LOG_INFO("TLS handshake wants read - continuing");
+                return HTTP_SERVER_ERROR_SSL_HANDSHAKE; // Non-fatal, continue
+                
+            case SSL_ERROR_WANT_WRITE:
+                HTTP_LOG_INFO("TLS handshake wants write - continuing");
+                return HTTP_SERVER_ERROR_SSL_HANDSHAKE; // Non-fatal, continue
+                
+            case SSL_ERROR_ZERO_RETURN:
+                HTTP_LOG_WARN("TLS connection closed cleanly during handshake");
+                return HTTP_SERVER_ERROR_SSL_HANDSHAKE;
+                
+            case SSL_ERROR_SYSCALL: {
+                unsigned long err = ERR_get_error();
+                if (err == 0) {
+                    if (result == 0) {
+                        HTTP_LOG_ERROR("TLS handshake failed: unexpected EOF");
+                    } else {
+                        HTTP_LOG_ERROR("TLS handshake failed: system call error");
+                    }
+                } else {
+                    char err_buf[256];
+                    ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                    HTTP_LOG_ERROR("TLS handshake failed: %s", err_buf);
+                }
+                return HTTP_SERVER_ERROR_SSL_HANDSHAKE;
+            }
+            
+            default: {
+                char err_buf[256];
+                ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+                HTTP_LOG_ERROR("TLS handshake failed: %s (SSL error: %d)", err_buf, ssl_error);
+                return HTTP_SERVER_ERROR_SSL_HANDSHAKE;
+            }
         }
     }
 }
@@ -223,10 +572,12 @@ static int handle_tls_handshake(http_connection_t* conn) {
 // Write completion callback
 static void on_write(uv_write_t* req, int status) {
     http_connection_t* conn = (http_connection_t*)req->handle;
-    free(req);
+    
+    // Free the write request using memory pool
+    http_free(conn->server, req, sizeof(uv_write_t));
     
     if (status) {
-        fprintf(stderr, "Write error %s\n", uv_strerror(status));
+        HTTP_LOG_ERROR("Write error %s", uv_strerror(status));
         uv_close((uv_handle_t*)conn, free_connection);
         return;
     }
@@ -248,16 +599,16 @@ static void flush_tls_data(http_connection_t* conn) {
         int bytes = BIO_read(conn->write_bio, buffer, bytes_to_read);
         
         if (bytes > 0) {
-            uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
+            uv_write_t* req = (uv_write_t*)http_malloc(conn->server, sizeof(uv_write_t));
             if (!req) {
-                fprintf(stderr, "Failed to allocate write request\n");
+                HTTP_LOG_ERROR("Failed to allocate write request");
                 return;
             }
             
-            char* write_buf = malloc(bytes);
+            char* write_buf = http_malloc(conn->server, bytes);
             if (!write_buf) {
-                fprintf(stderr, "Failed to allocate write buffer\n");
-                free(req);
+                HTTP_LOG_ERROR("Failed to allocate write buffer");
+                http_free(conn->server, req, sizeof(uv_write_t));
                 return;
             }
             
@@ -266,9 +617,9 @@ static void flush_tls_data(http_connection_t* conn) {
             
             int result = uv_write(req, (uv_stream_t*)conn, &buf, 1, on_write);
             if (result != 0) {
-                fprintf(stderr, "uv_write failed in flush_tls_data: %s\n", uv_strerror(result));
-                free(req);
-                free(write_buf);
+                HTTP_LOG_ERROR("uv_write failed in flush_tls_data: %s", uv_strerror(result));
+                http_free(conn->server, req, sizeof(uv_write_t));
+                http_free(conn->server, write_buf, bytes);
             }
         }
     }
@@ -302,9 +653,9 @@ static int on_url(llhttp_t* parser, const char* at, size_t length) {
     http_connection_t* conn = (http_connection_t*)parser->data;
     
     if (!conn->url) {
-        conn->url = malloc(length + 1);
+        conn->url = http_malloc(conn->server, length + 1);
         if (!conn->url) {
-            fprintf(stderr, "Failed to allocate memory for URL\n");
+            HTTP_LOG_ERROR("Failed to allocate memory for URL");
             return -1;
         }
         memcpy(conn->url, at, length);
@@ -322,9 +673,9 @@ static int on_header_field(llhttp_t* parser, const char* at, size_t length) {
         return -1;
     }
     
-    conn->headers[conn->header_count][0] = malloc(length + 1);
+    conn->headers[conn->header_count][0] = http_malloc(conn->server, length + 1);
     if (!conn->headers[conn->header_count][0]) {
-        fprintf(stderr, "Failed to allocate memory for header field\n");
+        HTTP_LOG_ERROR("Failed to allocate memory for header field");
         return -1;
     }
     
@@ -342,9 +693,9 @@ static int on_header_value(llhttp_t* parser, const char* at, size_t length) {
         return -1;
     }
     
-    conn->headers[conn->header_count][1] = malloc(length + 1);
+    conn->headers[conn->header_count][1] = http_malloc(conn->server, length + 1);
     if (!conn->headers[conn->header_count][1]) {
-        fprintf(stderr, "Failed to allocate memory for header value\n");
+        HTTP_LOG_ERROR("Failed to allocate memory for header value");
         return -1;
     }
     
@@ -361,7 +712,7 @@ static int on_headers_complete(llhttp_t* parser) {
     // Store method
     const char* method_str = llhttp_method_name(llhttp_get_method(parser));
     if (method_str) {
-        conn->method = strdup(method_str);
+        conn->method = http_strdup(conn->server, method_str);
     }
     
     return 0;
@@ -371,10 +722,11 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
     http_connection_t* conn = (http_connection_t*)parser->data;
     
     if (conn->body_length + length > conn->body_capacity) {
+        size_t old_capacity = conn->body_capacity;
         size_t new_capacity = (conn->body_length + length) * 2;
-        char* new_body = realloc(conn->body, new_capacity);
+        char* new_body = http_realloc(conn->server, conn->body, old_capacity, new_capacity);
         if (!new_body) {
-            fprintf(stderr, "Failed to reallocate memory for request body\n");
+            HTTP_LOG_ERROR("Failed to reallocate memory for request body");
             return -1;
         }
         conn->body = new_body;
@@ -393,10 +745,11 @@ static int on_message_complete(llhttp_t* parser) {
     // Null-terminate body if it exists
     if (conn->body) {
         if (conn->body_length >= conn->body_capacity) {
+            size_t old_capacity = conn->body_capacity;
             size_t new_capacity = conn->body_capacity + 1;
-            char* new_body = realloc(conn->body, new_capacity);
+            char* new_body = http_realloc(conn->server, conn->body, old_capacity, new_capacity);
             if (!new_body) {
-                fprintf(stderr, "Failed to reallocate memory for null terminator\n");
+                HTTP_LOG_ERROR("Failed to reallocate memory for null terminator");
                 return -1;
             }
             conn->body = new_body;
@@ -444,14 +797,21 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         
         // Handle TLS handshake
         if (!conn->handshake_complete) {
-            int hs_result = handle_tls_handshake(conn);
-            if (hs_result < 0) {
+            http_server_error_t hs_result = handle_tls_handshake(conn);
+            if (hs_result == HTTP_SERVER_ERROR_SSL_HANDSHAKE) {
+                // Non-fatal handshake error, continue processing
+                flush_tls_data(conn);
+                if (!conn->handshake_complete) {
+                    goto cleanup; // Still in progress, wait for more data
+                }
+            } else if (hs_result != HTTP_SERVER_SUCCESS) {
+                // Fatal error
+                HTTP_LOG_ERROR("Fatal TLS handshake error, closing connection");
                 uv_close((uv_handle_t*)conn, free_connection);
                 goto cleanup;
-            }
-            flush_tls_data(conn);
-            if (!conn->handshake_complete) {
-                goto cleanup;
+            } else {
+                // Success
+                flush_tls_data(conn);
             }
         }
         
@@ -463,7 +823,11 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 // Parse HTTP with llhttp
                 llhttp_errno_t err = llhttp_execute(&conn->parser, http_buf, bytes);
                 if (err != HPE_OK) {
-                    fprintf(stderr, "HTTP parse error: %s\n", llhttp_errno_name(err));
+                    HTTP_LOG_ERROR("HTTP parse error in TLS mode: %s (error code: %d)", 
+                                 llhttp_errno_name(err), err);
+                    HTTP_LOG_ERROR("Parser state: method=%s, url=%s", 
+                                 conn->method ? conn->method : "<none>",
+                                 conn->url ? conn->url : "<none>");
                     uv_close((uv_handle_t*)conn, free_connection);
                     goto cleanup;
                 }
@@ -483,7 +847,25 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         // Plain HTTP mode: directly parse the raw data
         llhttp_errno_t err = llhttp_execute(&conn->parser, buf->base, nread);
         if (err != HPE_OK) {
-            fprintf(stderr, "HTTP parse error: %s\n", llhttp_errno_name(err));
+            HTTP_LOG_ERROR("HTTP parse error in plain mode: %s (error code: %d)", 
+                         llhttp_errno_name(err), err);
+            HTTP_LOG_ERROR("Parser state: method=%s, url=%s, received %ld bytes", 
+                         conn->method ? conn->method : "<none>",
+                         conn->url ? conn->url : "<none>", nread);
+            
+            // Log problematic data for debugging (first 100 chars max)
+            size_t log_len = nread > 100 ? 100 : nread;
+            char debug_buf[101];
+            memcpy(debug_buf, buf->base, log_len);
+            debug_buf[log_len] = '\0';
+            // Replace non-printable characters with dots for safe logging
+            for (size_t i = 0; i < log_len; i++) {
+                if (debug_buf[i] < 32 || debug_buf[i] > 126) {
+                    debug_buf[i] = '.';
+                }
+            }
+            HTTP_LOG_ERROR("Received data (first %zu bytes): %s", log_len, debug_buf);
+            
             uv_close((uv_handle_t*)conn, free_connection);
             goto cleanup;
         }
@@ -491,36 +873,52 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
 cleanup:
     if (buf->base) {
-        free(buf->base);
+        http_free(conn->server, buf->base, buf->len);
     }
 }
 
 // New connection callback
 static void on_new_connection(uv_stream_t* server, int status) {
     if (status < 0) {
-        fprintf(stderr, "New connection error %s\n", uv_strerror(status));
+        HTTP_LOG_ERROR("New connection error: %s", uv_strerror(status));
         return;
     }
 
-    http_server_t* http_server = (http_server_t*)server->data;
-    http_connection_t* conn = (http_connection_t*)malloc(sizeof(http_connection_t));
-    if (!conn) {
-        fprintf(stderr, "Failed to allocate memory for connection\n");
+    if (!server || !server->data) {
+        HTTP_LOG_ERROR("Invalid parameter: server or server->data is NULL");
         return;
     }
+    
+    http_server_t* http_server = (http_server_t*)server->data;
+    
+    http_connection_t* conn __attribute__((cleanup(cleanup_http_connection))) = NULL;
+    conn = (http_connection_t*)memory_pool_alloc(&http_server->connection_pool);
+    if (!conn) {
+        HTTP_LOG_ERROR("Failed to allocate connection from pool, falling back to malloc");
+        conn = (http_connection_t*)malloc(sizeof(http_connection_t));
+        HTTP_CHECK_MALLOC(conn, return);
+    }
+    
     memset(conn, 0, sizeof(http_connection_t));
     
     conn->server = http_server;
     conn->tls_enabled = http_server->tls_enabled;
-    uv_tcp_init(http_server->loop, &conn->tcp);
+    
+    int init_result = uv_tcp_init(http_server->loop, &conn->tcp);
+    if (init_result != 0) {
+        HTTP_LOG_ERROR("Failed to initialize TCP handle: %s", uv_strerror(init_result));
+        return;
+    }
+    
     conn->tcp.data = conn;
     
-    if (uv_accept(server, (uv_stream_t*)conn) == 0) {
+    int accept_result = uv_accept(server, (uv_stream_t*)conn);
+    if (accept_result == 0) {
         // Setup SSL only if TLS is enabled
         if (conn->tls_enabled) {
             conn->ssl = SSL_new(http_server->ssl_ctx);
             if (!conn->ssl) {
-                fprintf(stderr, "Failed to create SSL object\n");
+                HTTP_LOG_ERROR("Failed to create SSL object");
                 free(conn);
                 return;
             }
@@ -529,7 +927,9 @@ static void on_new_connection(uv_stream_t* server, int status) {
             conn->write_bio = BIO_new(BIO_s_mem());
             
             if (!conn->read_bio || !conn->write_bio) {
-                fprintf(stderr, "Failed to create BIO objects\n");
+                HTTP_LOG_ERROR("Failed to create BIO objects");
+                if (conn->read_bio) BIO_free(conn->read_bio);
+                if (conn->write_bio) BIO_free(conn->write_bio);
                 SSL_free(conn->ssl);
                 free(conn);
                 return;
@@ -552,15 +952,26 @@ static void on_new_connection(uv_stream_t* server, int status) {
         llhttp_init(&conn->parser, HTTP_REQUEST, &conn->parser_settings);
         conn->parser.data = conn;
         
-        uv_read_start((uv_stream_t*)conn, alloc_buffer, on_read);
+        int read_result = uv_read_start((uv_stream_t*)conn, alloc_buffer, on_read);
+        if (read_result != 0) {
+            HTTP_LOG_ERROR("Failed to start reading from connection: %s", uv_strerror(read_result));
+            if (conn->tls_enabled && conn->ssl) {
+                SSL_free(conn->ssl);
+            }
+            uv_close((uv_handle_t*)conn, free_connection);
+            return;
+        }
         if (conn->tls_enabled) {
             printf("New connection accepted, starting TLS handshake\n");
         } else {
             printf("New HTTP connection accepted\n");
         }
+        // Successfully accepted and configured connection
+        conn = NULL; // Transfer ownership to prevent cleanup
+        
     } else {
-        fprintf(stderr, "Failed to accept connection\n");
-        free(conn);
+        HTTP_LOG_ERROR("Failed to accept connection: %s", uv_strerror(accept_result));
+        // conn will be cleaned up automatically by HTTP_AUTO_CLEANUP
     }
 }
 
@@ -617,26 +1028,76 @@ http_server_t* http_server_create(const http_server_config_t* config) {
     server->tls_enabled = config->tls_enabled;
     
     if (config->tls_enabled) {
+        http_server_error_t ssl_result;
         if (config->cert_file && config->key_file) {
             // Custom certificates
-            if (!init_ssl_with_certs(server, config->cert_file, config->key_file)) {
-                free(server);
-                return NULL;
-            }
+            ssl_result = init_ssl_with_certs(server, config->cert_file, config->key_file);
         } else {
             // Self-signed certificate
-            if (!init_ssl(server)) {
-                free(server);
-                return NULL;
+            ssl_result = init_ssl(server);
+        }
+        
+        if (ssl_result != HTTP_SERVER_SUCCESS) {
+            if (server->ssl_ctx) {
+                SSL_CTX_free(server->ssl_ctx);
             }
+            free(server);
+            return NULL;
         }
     } else {
         // Plain HTTP, no SSL needed
         server->ssl_ctx = NULL;
     }
     
+    // Initialize memory pools
+    http_server_error_t pool_result;
+    
+    pool_result = memory_pool_init(&server->small_pool, MEMORY_POOL_SMALL_SIZE, MEMORY_POOL_SMALL_COUNT);
+    if (pool_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_ERROR("Failed to initialize small memory pool");
+        if (server->ssl_ctx) SSL_CTX_free(server->ssl_ctx);
+        free(server);
+        return NULL;
+    }
+    
+    pool_result = memory_pool_init(&server->medium_pool, MEMORY_POOL_MEDIUM_SIZE, MEMORY_POOL_MEDIUM_COUNT);
+    if (pool_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_ERROR("Failed to initialize medium memory pool");
+        memory_pool_destroy(&server->small_pool);
+        if (server->ssl_ctx) SSL_CTX_free(server->ssl_ctx);
+        free(server);
+        return NULL;
+    }
+    
+    pool_result = memory_pool_init(&server->large_pool, MEMORY_POOL_LARGE_SIZE, MEMORY_POOL_LARGE_COUNT);
+    if (pool_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_ERROR("Failed to initialize large memory pool");
+        memory_pool_destroy(&server->medium_pool);
+        memory_pool_destroy(&server->small_pool);
+        if (server->ssl_ctx) SSL_CTX_free(server->ssl_ctx);
+        free(server);
+        return NULL;
+    }
+    
+    pool_result = memory_pool_init(&server->connection_pool, sizeof(http_connection_t), MEMORY_POOL_CONNECTION_COUNT);
+    if (pool_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_ERROR("Failed to initialize connection memory pool");
+        memory_pool_destroy(&server->large_pool);
+        memory_pool_destroy(&server->medium_pool);
+        memory_pool_destroy(&server->small_pool);
+        if (server->ssl_ctx) SSL_CTX_free(server->ssl_ctx);
+        free(server);
+        return NULL;
+    }
+    
+    // Initialize memory statistics
+    memset(&server->memory_stats, 0, sizeof(memory_stats_t));
+    
     uv_tcp_init(server->loop, &server->tcp);
     server->tcp.data = server;
+    
+    HTTP_LOG_INFO("HTTP server created with memory pools");
+    memory_stats_log(&server->memory_stats);
     
     return server;
 }
@@ -667,6 +1128,16 @@ int http_server_listen(http_server_t* server) {
 
 void http_server_destroy(http_server_t* server) {
     if (!server) return;
+    
+    // Log final memory statistics
+    HTTP_LOG_INFO("Server shutdown - Final memory statistics:");
+    memory_stats_log(&server->memory_stats);
+    
+    // Destroy memory pools
+    memory_pool_destroy(&server->connection_pool);
+    memory_pool_destroy(&server->large_pool);
+    memory_pool_destroy(&server->medium_pool);
+    memory_pool_destroy(&server->small_pool);
     
     if (server->ssl_ctx) {
         SSL_CTX_free(server->ssl_ctx);
