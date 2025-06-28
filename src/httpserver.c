@@ -274,6 +274,779 @@ char* http_strdup(http_server_t* server, const char* str) {
     return dup;
 }
 
+// Memory monitoring implementation
+void memory_pool_stats_log(const memory_pool_t* pool, const char* pool_name) {
+    if (!pool || !pool_name) return;
+    
+    double usage_percent = 0.0;
+    if (pool->block_count > 0) {
+        usage_percent = (double)pool->allocated_count / pool->block_count * 100.0;
+    }
+    
+    HTTP_LOG_INFO("Pool [%s]: %zu/%zu blocks used (%.1f%%), %zu bytes each", 
+                  pool_name, pool->allocated_count, pool->block_count, 
+                  usage_percent, pool->block_size);
+    
+    // Check for pool exhaustion warning
+    if (usage_percent >= MEMORY_POOL_LOW_THRESHOLD * 100.0) {
+        HTTP_LOG_WARN("Pool [%s] is %.1f%% full - consider increasing pool size", 
+                      pool_name, usage_percent);
+    }
+}
+
+void memory_stats_log_detailed(const http_server_t* server) {
+    if (!server) return;
+    
+    HTTP_LOG_INFO("=== Detailed Memory Statistics ===");
+    
+    // Overall statistics
+    memory_stats_log(&server->memory_stats);
+    
+    // Individual pool statistics
+    memory_pool_stats_log(&server->small_pool, "Small");
+    memory_pool_stats_log(&server->medium_pool, "Medium");
+    memory_pool_stats_log(&server->large_pool, "Large");
+    memory_pool_stats_log(&server->connection_pool, "Connection");
+    
+    // Calculate memory efficiency
+    size_t total_pool_memory = 
+        (server->small_pool.block_count * server->small_pool.block_size) +
+        (server->medium_pool.block_count * server->medium_pool.block_size) +
+        (server->large_pool.block_count * server->large_pool.block_size) +
+        (server->connection_pool.block_count * server->connection_pool.block_size);
+    
+    HTTP_LOG_INFO("Total pool memory reserved: %zu bytes (%.2f MB)", 
+                  total_pool_memory, (double)total_pool_memory / (1024 * 1024));
+    
+    if (server->memory_stats.total_allocated > 0) {
+        double efficiency = (double)server->memory_stats.pool_hits / 
+                           (server->memory_stats.pool_hits + server->memory_stats.pool_misses) * 100.0;
+        HTTP_LOG_INFO("Memory pool efficiency: %.2f%%", efficiency);
+    }
+    
+    HTTP_LOG_INFO("================================");
+}
+
+void memory_stats_check_thresholds(const http_server_t* server) {
+    if (!server) return;
+    
+    // Convert bytes to MB for threshold comparison
+    double current_usage_mb = (double)server->memory_stats.current_usage / (1024 * 1024);
+    
+    // Check critical threshold
+    if (current_usage_mb >= MEMORY_CRITICAL_THRESHOLD_MB) {
+        HTTP_LOG_ERROR("CRITICAL: Memory usage %.2f MB exceeds critical threshold %d MB", 
+                       current_usage_mb, MEMORY_CRITICAL_THRESHOLD_MB);
+        HTTP_LOG_ERROR("Consider restarting the server or investigating memory leaks");
+    }
+    // Check warning threshold
+    else if (current_usage_mb >= MEMORY_WARNING_THRESHOLD_MB) {
+        HTTP_LOG_WARN("WARNING: Memory usage %.2f MB exceeds warning threshold %d MB", 
+                      current_usage_mb, MEMORY_WARNING_THRESHOLD_MB);
+    }
+    
+    // Check individual pool utilization
+    double small_usage = (double)server->small_pool.allocated_count / server->small_pool.block_count;
+    double medium_usage = (double)server->medium_pool.allocated_count / server->medium_pool.block_count;
+    double large_usage = (double)server->large_pool.allocated_count / server->large_pool.block_count;
+    double conn_usage = (double)server->connection_pool.allocated_count / server->connection_pool.block_count;
+    
+    if (small_usage >= MEMORY_POOL_LOW_THRESHOLD) {
+        HTTP_LOG_WARN("Small pool utilization high: %.1f%%", small_usage * 100.0);
+    }
+    if (medium_usage >= MEMORY_POOL_LOW_THRESHOLD) {
+        HTTP_LOG_WARN("Medium pool utilization high: %.1f%%", medium_usage * 100.0);
+    }
+    if (large_usage >= MEMORY_POOL_LOW_THRESHOLD) {
+        HTTP_LOG_WARN("Large pool utilization high: %.1f%%", large_usage * 100.0);
+    }
+    if (conn_usage >= MEMORY_POOL_LOW_THRESHOLD) {
+        HTTP_LOG_WARN("Connection pool utilization high: %.1f%%", conn_usage * 100.0);
+    }
+}
+
+// Timer callback for periodic memory statistics logging
+static void memory_stats_timer_cb(uv_timer_t* timer) {
+    http_server_t* server = (http_server_t*)timer->data;
+    if (!server) return;
+    
+    HTTP_LOG_INFO("=== Periodic Memory Report ===");
+    memory_stats_log_detailed(server);
+    memory_stats_check_thresholds(server);
+    
+    // Adaptive buffer maintenance
+    HTTP_LOG_INFO("=== Adaptive Buffer Report ===");
+    buffer_stats_log(&server->request_buffer_stats, "Request Body");
+    buffer_stats_log(&server->response_buffer_stats, "Response");
+    buffer_stats_log(&server->read_buffer_stats, "Network Read");
+    
+    // Update server defaults based on collected statistics
+    adaptive_buffer_update_server_defaults(server);
+}
+
+// Enable memory monitoring with periodic logging
+http_server_error_t memory_monitoring_start(http_server_t* server) {
+    if (!server) return HTTP_SERVER_ERROR_INVALID_PARAM;
+    
+    int result = uv_timer_init(server->loop, &server->memory_stats_timer);
+    if (result != 0) {
+        HTTP_LOG_ERROR("Failed to initialize memory stats timer: %s", uv_strerror(result));
+        return HTTP_SERVER_ERROR_MEMORY;
+    }
+    
+    server->memory_stats_timer.data = server;
+    
+    result = uv_timer_start(&server->memory_stats_timer, memory_stats_timer_cb, 
+                           MEMORY_STATS_LOG_INTERVAL, MEMORY_STATS_LOG_INTERVAL);
+    if (result != 0) {
+        HTTP_LOG_ERROR("Failed to start memory stats timer: %s", uv_strerror(result));
+        return HTTP_SERVER_ERROR_MEMORY;
+    }
+    
+    server->memory_monitoring_enabled = 1;
+    HTTP_LOG_INFO("Memory monitoring started (interval: %d seconds)", 
+                  MEMORY_STATS_LOG_INTERVAL / 1000);
+    
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Disable memory monitoring
+void memory_monitoring_stop(http_server_t* server) {
+    if (!server || !server->memory_monitoring_enabled) return;
+    
+    uv_timer_stop(&server->memory_stats_timer);
+    server->memory_monitoring_enabled = 0;
+    HTTP_LOG_INFO("Memory monitoring stopped");
+}
+
+// Memory leak detection
+void memory_leak_check(const http_server_t* server) {
+    if (!server) return;
+    
+    HTTP_LOG_INFO("=== Memory Leak Check ===");
+    
+    // Check for unfreed allocations
+    if (server->memory_stats.current_usage > 0) {
+        HTTP_LOG_WARN("Potential memory leak detected: %zu bytes still allocated", 
+                      server->memory_stats.current_usage);
+        
+        double leak_mb = (double)server->memory_stats.current_usage / (1024 * 1024);
+        if (leak_mb > 1.0) {
+            HTTP_LOG_ERROR("Significant memory leak: %.2f MB not freed", leak_mb);
+        }
+    } else {
+        HTTP_LOG_INFO("No memory leaks detected - all memory properly freed");
+    }
+    
+    // Check pool consistency
+    size_t total_allocated = server->small_pool.allocated_count + 
+                            server->medium_pool.allocated_count +
+                            server->large_pool.allocated_count +
+                            server->connection_pool.allocated_count;
+    
+    if (total_allocated > 0) {
+        HTTP_LOG_WARN("Pool leak detected: %zu blocks still allocated across all pools", 
+                      total_allocated);
+        
+        if (server->small_pool.allocated_count > 0) {
+            HTTP_LOG_WARN("Small pool: %zu blocks not returned", 
+                          server->small_pool.allocated_count);
+        }
+        if (server->medium_pool.allocated_count > 0) {
+            HTTP_LOG_WARN("Medium pool: %zu blocks not returned", 
+                          server->medium_pool.allocated_count);
+        }
+        if (server->large_pool.allocated_count > 0) {
+            HTTP_LOG_WARN("Large pool: %zu blocks not returned", 
+                          server->large_pool.allocated_count);
+        }
+        if (server->connection_pool.allocated_count > 0) {
+            HTTP_LOG_WARN("Connection pool: %zu blocks not returned", 
+                          server->connection_pool.allocated_count);
+        }
+    } else {
+        HTTP_LOG_INFO("All pool blocks properly returned");
+    }
+    
+    // Calculate allocation/deallocation balance
+    if (server->memory_stats.total_allocated != server->memory_stats.total_freed) {
+        size_t imbalance = server->memory_stats.total_allocated > server->memory_stats.total_freed ?
+                          server->memory_stats.total_allocated - server->memory_stats.total_freed :
+                          server->memory_stats.total_freed - server->memory_stats.total_allocated;
+        
+        HTTP_LOG_WARN("Allocation/deallocation imbalance: %zu bytes", imbalance);
+        HTTP_LOG_INFO("Total allocated: %zu bytes, Total freed: %zu bytes", 
+                      server->memory_stats.total_allocated, server->memory_stats.total_freed);
+    }
+    
+    HTTP_LOG_INFO("========================");
+}
+
+// ===== Adaptive Buffer Management Implementation =====
+
+// Initialize buffer statistics
+void buffer_stats_init(buffer_stats_t* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(buffer_stats_t));
+    stats->last_update = time(NULL);
+    stats->optimal_size = ADAPTIVE_BUFFER_MIN_SIZE;
+}
+
+// Update buffer statistics with new size sample
+void buffer_stats_update(buffer_stats_t* stats, size_t size) {
+    if (!stats || size == 0) return;
+    
+    // Add new sample to circular buffer
+    stats->recent_sizes[stats->current_index] = size;
+    stats->current_index = (stats->current_index + 1) % ADAPTIVE_BUFFER_SAMPLES;
+    
+    if (stats->sample_count < ADAPTIVE_BUFFER_SAMPLES) {
+        stats->sample_count++;
+    }
+    
+    stats->total_allocations++;
+    stats->last_update = time(NULL);
+    
+    // Recalculate average and optimal size
+    size_t sum = 0;
+    for (size_t i = 0; i < stats->sample_count; i++) {
+        sum += stats->recent_sizes[i];
+    }
+    
+    stats->average_size = sum / stats->sample_count;
+    
+    // Calculate optimal size with some overhead
+    size_t new_optimal = (size_t)(stats->average_size * ADAPTIVE_BUFFER_GROWTH_FACTOR);
+    
+    // Clamp to min/max bounds
+    if (new_optimal < ADAPTIVE_BUFFER_MIN_SIZE) {
+        new_optimal = ADAPTIVE_BUFFER_MIN_SIZE;
+    } else if (new_optimal > ADAPTIVE_BUFFER_MAX_SIZE) {
+        new_optimal = ADAPTIVE_BUFFER_MAX_SIZE;
+    }
+    
+    // Only update optimal size if it's significantly different
+    if (labs((long)new_optimal - (long)stats->optimal_size) > (long)(stats->optimal_size * 0.1)) {
+        stats->optimal_size = new_optimal;
+        stats->resize_count++;
+    }
+}
+
+// Get optimal buffer size based on statistics
+size_t buffer_stats_get_optimal_size(const buffer_stats_t* stats) {
+    if (!stats || stats->sample_count == 0) {
+        return ADAPTIVE_BUFFER_MIN_SIZE;
+    }
+    
+    return stats->optimal_size;
+}
+
+// Log buffer statistics
+void buffer_stats_log(const buffer_stats_t* stats, const char* buffer_type) {
+    if (!stats || !buffer_type) return;
+    
+    if (stats->sample_count == 0) {
+        HTTP_LOG_INFO("Buffer [%s]: No samples yet", buffer_type);
+        return;
+    }
+    
+    double efficiency = stats->total_allocations > 0 ? 
+                       (double)stats->resize_count / stats->total_allocations * 100.0 : 0.0;
+    
+    HTTP_LOG_INFO("Buffer [%s]: avg=%zu, optimal=%zu, samples=%zu, resizes=%zu (%.1f%% efficiency)",
+                  buffer_type, stats->average_size, stats->optimal_size, 
+                  stats->sample_count, stats->resize_count, 100.0 - efficiency);
+}
+
+// Initialize TLS buffer
+http_server_error_t tls_buffer_init(tls_buffer_t* buffer, size_t initial_size) {
+    HTTP_CHECK_PARAM(buffer, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    memset(buffer, 0, sizeof(tls_buffer_t));
+    
+    if (initial_size < TLS_BUFFER_INITIAL_SIZE) {
+        initial_size = TLS_BUFFER_INITIAL_SIZE;
+    }
+    
+    buffer->data = malloc(initial_size);
+    if (!buffer->data) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to allocate TLS buffer");
+    }
+    
+    buffer->capacity = initial_size;
+    buffer->optimal_capacity = initial_size;
+    buffer_stats_init(&buffer->stats);
+    
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Destroy TLS buffer
+void tls_buffer_destroy(tls_buffer_t* buffer) {
+    if (!buffer) return;
+    
+    free(buffer->data);
+    memset(buffer, 0, sizeof(tls_buffer_t));
+}
+
+// Ensure TLS buffer has required capacity
+http_server_error_t tls_buffer_ensure_capacity(tls_buffer_t* buffer, size_t required_size) {
+    HTTP_CHECK_PARAM(buffer, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    if (buffer->capacity >= required_size) {
+        return HTTP_SERVER_SUCCESS;
+    }
+    
+    // Calculate new capacity with some growth
+    size_t new_capacity = required_size * 2;
+    if (new_capacity > TLS_BUFFER_MAX_SIZE) {
+        new_capacity = TLS_BUFFER_MAX_SIZE;
+        if (new_capacity < required_size) {
+            HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_BUFFER_OVERFLOW, 
+                            "Required TLS buffer size %zu exceeds maximum %zu", 
+                            required_size, (size_t)TLS_BUFFER_MAX_SIZE);
+        }
+    }
+    
+    char* new_data = realloc(buffer->data, new_capacity);
+    if (!new_data) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, 
+                        "Failed to resize TLS buffer from %zu to %zu bytes", 
+                        buffer->capacity, new_capacity);
+    }
+    
+    buffer->data = new_data;
+    buffer->capacity = new_capacity;
+    
+    // Update statistics
+    buffer_stats_update(&buffer->stats, required_size);
+    
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Adaptive resize of TLS buffer based on usage patterns
+http_server_error_t tls_buffer_adaptive_resize(tls_buffer_t* buffer) {
+    HTTP_CHECK_PARAM(buffer, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    size_t optimal = buffer_stats_get_optimal_size(&buffer->stats);
+    
+    // Only resize if optimal size is significantly different and beneficial
+    if (optimal != buffer->optimal_capacity && 
+        labs((long)optimal - (long)buffer->capacity) > (long)(buffer->capacity * 0.2)) {
+        
+        // For shrinking, only do it if we haven't used the extra space recently
+        if (optimal < buffer->capacity) {
+            time_t now = time(NULL);
+            if (now - buffer->stats.last_update < 60) {  // Don't shrink if recently active
+                return HTTP_SERVER_SUCCESS;
+            }
+        }
+        
+        char* new_data = realloc(buffer->data, optimal);
+        if (!new_data) {
+            // Realloc failure for shrinking is not critical
+            if (optimal > buffer->capacity) {
+                HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, 
+                                "Failed to grow TLS buffer to optimal size %zu", optimal);
+            }
+            return HTTP_SERVER_SUCCESS;  // Shrinking failure is acceptable
+        }
+        
+        buffer->data = new_data;
+        buffer->capacity = optimal;
+        buffer->optimal_capacity = optimal;
+        
+        HTTP_LOG_INFO("TLS buffer adaptively resized to %zu bytes", optimal);
+    }
+    
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Calculate adaptive buffer size
+size_t adaptive_buffer_size(size_t current_size __attribute__((unused)), size_t required_size, const buffer_stats_t* stats) {
+    if (!stats || stats->sample_count == 0) {
+        // No statistics yet, use default growth
+        size_t new_size = required_size * 2;
+        return new_size < ADAPTIVE_BUFFER_MIN_SIZE ? ADAPTIVE_BUFFER_MIN_SIZE : 
+               new_size > ADAPTIVE_BUFFER_MAX_SIZE ? ADAPTIVE_BUFFER_MAX_SIZE : new_size;
+    }
+    
+    size_t optimal = buffer_stats_get_optimal_size(stats);
+    
+    // If required size fits in optimal, use optimal
+    if (required_size <= optimal) {
+        return optimal;
+    }
+    
+    // Otherwise, grow from required size
+    size_t new_size = (size_t)(required_size * ADAPTIVE_BUFFER_GROWTH_FACTOR);
+    return new_size > ADAPTIVE_BUFFER_MAX_SIZE ? ADAPTIVE_BUFFER_MAX_SIZE : new_size;
+}
+
+// Update server's default buffer sizes based on collected statistics
+void adaptive_buffer_update_server_defaults(http_server_t* server) {
+    if (!server) return;
+    
+    // Update default read buffer size
+    size_t optimal_read = buffer_stats_get_optimal_size(&server->read_buffer_stats);
+    if (optimal_read != server->default_read_buffer_size) {
+        server->default_read_buffer_size = optimal_read;
+        HTTP_LOG_INFO("Updated default read buffer size to %zu bytes", optimal_read);
+    }
+}
+
+// Get adaptive read buffer size
+size_t adaptive_read_buffer_size(const http_server_t* server, size_t suggested_size) {
+    if (!server) return suggested_size;
+    
+    size_t optimal = server->default_read_buffer_size;
+    
+    // Use the larger of suggested or optimal size
+    return suggested_size > optimal ? suggested_size : optimal;
+}
+
+// ===== Async I/O Optimization Implementation =====
+
+// Forward declaration
+static void free_connection(uv_handle_t* handle);
+
+// Initialize write request pool
+http_server_error_t write_pool_init(write_pool_t* pool) {
+    HTTP_CHECK_PARAM(pool, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    memset(pool, 0, sizeof(write_pool_t));
+    
+    int result = pthread_mutex_init(&pool->mutex, NULL);
+    if (result != 0) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to initialize write pool mutex");
+    }
+    
+    // Pre-allocate write request structures
+    pool->allocated_requests = calloc(WRITE_REQUEST_POOL_SIZE, sizeof(write_request_t));
+    if (!pool->allocated_requests) {
+        pthread_mutex_destroy(&pool->mutex);
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to allocate write request pool");
+    }
+    
+    // Initialize free list
+    pool->free_list = NULL;
+    for (int i = 0; i < WRITE_REQUEST_POOL_SIZE; i++) {
+        write_request_t* req = &pool->allocated_requests[i];
+        req->is_pooled = 1;
+        req->next = pool->free_list;
+        pool->free_list = req;
+        pool->free_count++;
+    }
+    
+    pool->allocated_count = WRITE_REQUEST_POOL_SIZE;
+    
+    HTTP_LOG_INFO("Write request pool initialized with %d requests", WRITE_REQUEST_POOL_SIZE);
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Destroy write request pool
+void write_pool_destroy(write_pool_t* pool) {
+    if (!pool) return;
+    
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool->allocated_requests);
+    memset(pool, 0, sizeof(write_pool_t));
+}
+
+// Acquire write request from pool
+write_request_t* write_pool_acquire(write_pool_t* pool) {
+    if (!pool) return NULL;
+    
+    pthread_mutex_lock(&pool->mutex);
+    
+    write_request_t* req = NULL;
+    if (pool->free_list) {
+        req = pool->free_list;
+        pool->free_list = req->next;
+        pool->free_count--;
+        
+        // Reset request structure
+        memset(&req->uv_req, 0, sizeof(uv_write_t));
+        req->connection = NULL;
+        req->buffer = NULL;
+        req->buffer_size = 0;
+        req->buffer_count = 0;
+        req->next = NULL;
+        memset(req->bufs, 0, sizeof(req->bufs));
+    }
+    
+    pthread_mutex_unlock(&pool->mutex);
+    
+    // If pool exhausted, allocate new request
+    if (!req) {
+        req = malloc(sizeof(write_request_t));
+        if (req) {
+            memset(req, 0, sizeof(write_request_t));
+            req->is_pooled = 0;
+        }
+    }
+    
+    return req;
+}
+
+// Release write request back to pool
+void write_pool_release(write_pool_t* pool, write_request_t* req) {
+    if (!pool || !req) return;
+    
+    // Clean up request data
+    if (req->buffer) {
+        if (req->connection && req->connection->server) {
+            http_free(req->connection->server, req->buffer, req->buffer_size);
+        } else {
+            free(req->buffer);
+        }
+        req->buffer = NULL;
+    }
+    
+    if (req->is_pooled) {
+        pthread_mutex_lock(&pool->mutex);
+        req->next = pool->free_list;
+        pool->free_list = req;
+        pool->free_count++;
+        pthread_mutex_unlock(&pool->mutex);
+    } else {
+        free(req);
+    }
+}
+
+// Initialize I/O statistics
+void io_stats_init(io_stats_t* stats) {
+    if (!stats) return;
+    
+    memset(stats, 0, sizeof(io_stats_t));
+    stats->last_update = time(NULL);
+}
+
+// Update read statistics
+void io_stats_update_read(io_stats_t* stats, size_t bytes) {
+    if (!stats) return;
+    
+    stats->total_reads++;
+    stats->bytes_read += bytes;
+    stats->syscall_count++;
+    stats->last_update = time(NULL);
+}
+
+// Update write statistics
+void io_stats_update_write(io_stats_t* stats, size_t bytes, int vectored, int pooled) {
+    if (!stats) return;
+    
+    stats->total_writes++;
+    stats->bytes_written += bytes;
+    stats->syscall_count++;
+    
+    if (vectored) {
+        stats->vectored_writes++;
+    }
+    
+    if (pooled) {
+        stats->pooled_requests++;
+    } else {
+        stats->malloc_requests++;
+    }
+    
+    // Update averages
+    if (stats->total_writes > 0) {
+        stats->avg_write_size = (double)stats->bytes_written / stats->total_writes;
+    }
+    
+    if (stats->vectored_writes > 0) {
+        stats->avg_batch_size = (double)stats->total_writes / stats->vectored_writes;
+    }
+    
+    stats->last_update = time(NULL);
+}
+
+// Log I/O statistics
+void io_stats_log(const io_stats_t* stats) {
+    if (!stats) return;
+    
+    HTTP_LOG_INFO("=== I/O Performance Statistics ===");
+    HTTP_LOG_INFO("Reads: %zu total, %zu bytes (avg: %.1f bytes/read)", 
+                  stats->total_reads, stats->bytes_read,
+                  stats->total_reads > 0 ? (double)stats->bytes_read / stats->total_reads : 0.0);
+    HTTP_LOG_INFO("Writes: %zu total, %zu bytes (avg: %.1f bytes/write)", 
+                  stats->total_writes, stats->bytes_written, stats->avg_write_size);
+    HTTP_LOG_INFO("Vectored writes: %zu (%.1f%% of total, avg batch: %.1f)", 
+                  stats->vectored_writes, 
+                  stats->total_writes > 0 ? (double)stats->vectored_writes / stats->total_writes * 100.0 : 0.0,
+                  stats->avg_batch_size);
+    HTTP_LOG_INFO("Request pool usage: %zu pooled, %zu malloc'd (%.1f%% pool hit rate)", 
+                  stats->pooled_requests, stats->malloc_requests,
+                  (stats->pooled_requests + stats->malloc_requests) > 0 ? 
+                  (double)stats->pooled_requests / (stats->pooled_requests + stats->malloc_requests) * 100.0 : 0.0);
+    HTTP_LOG_INFO("Total syscalls: %zu", stats->syscall_count);
+    HTTP_LOG_INFO("=====================================");
+}
+
+// Optimized vectored write function
+http_server_error_t async_write_vectored(struct http_connection_s* conn, 
+                                        uv_buf_t* bufs, int buf_count,
+                                        uv_write_cb callback) {
+    HTTP_CHECK_PARAM(conn && bufs && buf_count > 0, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    if (buf_count > VECTORED_IO_MAX_BUFFERS) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_INVALID_PARAM, 
+                        "Buffer count %d exceeds maximum %d", buf_count, VECTORED_IO_MAX_BUFFERS);
+    }
+    
+    // Acquire write request from pool
+    write_request_t* req = write_pool_acquire(&conn->server->write_pool);
+    if (!req) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to acquire write request");
+    }
+    
+    req->connection = conn;
+    req->buffer_count = buf_count;
+    
+    // Copy buffer descriptors
+    memcpy(req->bufs, bufs, buf_count * sizeof(uv_buf_t));
+    
+    // For single buffer writes from http_respond, take ownership of the buffer
+    if (buf_count == 1 && bufs[0].len > 1024) {  // Likely a response buffer
+        req->buffer = bufs[0].base;
+        req->buffer_size = bufs[0].len;
+    }
+    
+    // Calculate total bytes
+    size_t total_bytes = 0;
+    for (int i = 0; i < buf_count; i++) {
+        total_bytes += bufs[i].len;
+    }
+    
+    // Set callback data
+    req->uv_req.data = req;
+    
+    // Update statistics
+    io_stats_update_write(&conn->server->io_stats, total_bytes, 1, req->is_pooled);
+    
+    // Perform vectored write
+    int result = uv_write(&req->uv_req, (uv_stream_t*)conn, req->bufs, buf_count, callback);
+    if (result != 0) {
+        write_pool_release(&conn->server->write_pool, req);
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_NETWORK, "uv_write failed: %s", uv_strerror(result));
+    }
+    
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Optimized response write function
+http_server_error_t async_write_response(struct http_connection_s* conn,
+                                        const char* headers, size_t header_len,
+                                        const char* body, size_t body_len,
+                                        uv_write_cb callback) {
+    HTTP_CHECK_PARAM(conn && headers && header_len > 0, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    uv_buf_t bufs[2];
+    int buf_count = 1;
+    
+    // Setup header buffer
+    bufs[0] = uv_buf_init((char*)headers, header_len);
+    
+    // Setup body buffer if present
+    if (body && body_len > 0) {
+        bufs[1] = uv_buf_init((char*)body, body_len);
+        buf_count = 2;
+    }
+    
+    return async_write_vectored(conn, bufs, buf_count, callback);
+}
+
+// Common write completion handler
+void async_write_complete(uv_write_t* req, int status) {
+    write_request_t* write_req = (write_request_t*)req->data;
+    if (!write_req) return;
+    
+    http_connection_t* conn = write_req->connection;
+    
+    if (status < 0) {
+        HTTP_LOG_ERROR("Write error: %s", uv_strerror(status));
+        // Close connection on write error will be handled by protocol layer
+        // Don't close here to avoid double-free issues
+    } else {
+        // Calculate total bytes written for statistics
+        size_t total_bytes = 0;
+        for (int i = 0; i < write_req->buffer_count; i++) {
+            total_bytes += write_req->bufs[i].len;
+        }
+        
+        // Handle post-write connection management
+        if (conn && conn->server) {
+            // Check if we should close the connection
+            if (conn->shutdown_sent) {
+                // Response sent and connection should be closed
+                uv_close((uv_handle_t*)conn, free_connection);
+            }
+            // For Keep-Alive connections, leave the connection open
+        }
+    }
+    
+    // Release write request back to pool
+    if (conn && conn->server) {
+        write_pool_release(&conn->server->write_pool, write_req);
+    } else {
+        // Fallback cleanup
+        if (write_req->buffer) {
+            free(write_req->buffer);
+        }
+        if (!write_req->is_pooled) {
+            free(write_req);
+        }
+    }
+}
+
+// I/O monitoring timer callback
+static void io_stats_timer_cb(uv_timer_t* timer) {
+    http_server_t* server = (http_server_t*)timer->data;
+    if (!server) return;
+    
+    HTTP_LOG_INFO("=== Periodic I/O Performance Report ===");
+    io_stats_log(&server->io_stats);
+}
+
+// Start I/O monitoring
+http_server_error_t io_monitoring_start(http_server_t* server) {
+    HTTP_CHECK_PARAM(server, HTTP_SERVER_ERROR_INVALID_PARAM);
+    
+    if (server->io_monitoring_enabled) {
+        HTTP_LOG_WARN("I/O monitoring already started");
+        return HTTP_SERVER_SUCCESS;
+    }
+    
+    int result = uv_timer_init(server->loop, &server->io_stats_timer);
+    if (result != 0) {
+        HTTP_RETURN_ERROR(HTTP_SERVER_ERROR_MEMORY, "Failed to initialize I/O stats timer: %s", uv_strerror(result));
+    }
+    
+    server->io_stats_timer.data = server;
+    
+    result = uv_timer_start(&server->io_stats_timer, io_stats_timer_cb, 
+                           IO_STATS_UPDATE_INTERVAL, IO_STATS_UPDATE_INTERVAL);
+    if (result != 0) {
+        HTTP_LOG_ERROR("Failed to start I/O stats timer: %s", uv_strerror(result));
+        return HTTP_SERVER_ERROR_MEMORY;
+    }
+    
+    server->io_monitoring_enabled = 1;
+    HTTP_LOG_INFO("I/O monitoring started (interval: %d ms)", IO_STATS_UPDATE_INTERVAL);
+    
+    return HTTP_SERVER_SUCCESS;
+}
+
+// Stop I/O monitoring
+void io_monitoring_stop(http_server_t* server) {
+    if (!server || !server->io_monitoring_enabled) return;
+    
+    uv_timer_stop(&server->io_stats_timer);
+    server->io_monitoring_enabled = 0;
+    HTTP_LOG_INFO("I/O monitoring stopped");
+}
+
 // SSL initialization functions with improved error handling
 static http_server_error_t generate_self_signed_cert(SSL_CTX* ctx) {
     HTTP_CHECK_PARAM(ctx, HTTP_SERVER_ERROR_INVALID_PARAM);
@@ -449,16 +1222,25 @@ static http_server_error_t init_ssl_with_certs(http_server_t* server, const char
     return HTTP_SERVER_SUCCESS;
 }
 
-// Memory allocation callback
+// Memory allocation callback with adaptive sizing
 static void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     http_connection_t* conn = (http_connection_t*)handle;
     
-    buf->base = (char*)http_malloc(conn->server, suggested_size);
+    // Use adaptive buffer sizing
+    size_t adaptive_size = adaptive_read_buffer_size(conn->server, suggested_size);
+    
+    buf->base = (char*)http_malloc(conn->server, adaptive_size);
     if (!buf->base) {
         buf->len = 0;
         return;
     }
-    buf->len = suggested_size;
+    buf->len = adaptive_size;
+    
+    // Update statistics for future optimization
+    buffer_stats_update(&conn->server->read_buffer_stats, adaptive_size);
+    
+    // Update I/O read statistics
+    io_stats_update_read(&conn->server->io_stats, adaptive_size);
 }
 
 // Connection cleanup
@@ -470,6 +1252,11 @@ static void free_connection(uv_handle_t* handle) {
     
     if (conn->ssl) {
         SSL_free(conn->ssl);
+    }
+    
+    // Cleanup adaptive TLS buffer
+    if (conn->tls_enabled) {
+        tls_buffer_destroy(&conn->tls_buffer);
     }
     
     // Free parsed request data using pool-aware functions
@@ -570,56 +1357,27 @@ static http_server_error_t handle_tls_handshake(http_connection_t* conn) {
 }
 
 // Write completion callback
-static void on_write(uv_write_t* req, int status) {
-    http_connection_t* conn = (http_connection_t*)req->handle;
-    
-    // Free the write request using memory pool
-    http_free(conn->server, req, sizeof(uv_write_t));
-    
-    if (status) {
-        HTTP_LOG_ERROR("Write error %s", uv_strerror(status));
-        uv_close((uv_handle_t*)conn, free_connection);
-        return;
-    }
-    
-    // Close connection after response is sent
-    if (conn->shutdown_sent) {
-        uv_close((uv_handle_t*)conn, free_connection);
-    }
-}
-
 // Flush TLS data to socket
 static void flush_tls_data(http_connection_t* conn) {
-    char buffer[16384];
     int pending = BIO_pending(conn->write_bio);
     
     if (pending > 0) {
-        // Ensure we don't read more than buffer size
-        int bytes_to_read = pending > (int)sizeof(buffer) ? (int)sizeof(buffer) : pending;
-        int bytes = BIO_read(conn->write_bio, buffer, bytes_to_read);
+        // Ensure TLS buffer has adequate capacity
+        http_server_error_t buffer_result = tls_buffer_ensure_capacity(&conn->tls_buffer, pending);
+        if (buffer_result != HTTP_SERVER_SUCCESS) {
+            HTTP_LOG_ERROR("Failed to ensure TLS buffer capacity for %d bytes", pending);
+            return;
+        }
+        
+        int bytes = BIO_read(conn->write_bio, conn->tls_buffer.data, pending);
         
         if (bytes > 0) {
-            uv_write_t* req = (uv_write_t*)http_malloc(conn->server, sizeof(uv_write_t));
-            if (!req) {
-                HTTP_LOG_ERROR("Failed to allocate write request");
-                return;
-            }
+            // Use optimized async write with TLS buffer data
+            uv_buf_t buf = uv_buf_init(conn->tls_buffer.data, bytes);
             
-            char* write_buf = http_malloc(conn->server, bytes);
-            if (!write_buf) {
-                HTTP_LOG_ERROR("Failed to allocate write buffer");
-                http_free(conn->server, req, sizeof(uv_write_t));
-                return;
-            }
-            
-            memcpy(write_buf, buffer, bytes);
-            uv_buf_t buf = uv_buf_init(write_buf, bytes);
-            
-            int result = uv_write(req, (uv_stream_t*)conn, &buf, 1, on_write);
-            if (result != 0) {
-                HTTP_LOG_ERROR("uv_write failed in flush_tls_data: %s", uv_strerror(result));
-                http_free(conn->server, req, sizeof(uv_write_t));
-                http_free(conn->server, write_buf, bytes);
+            http_server_error_t result = async_write_vectored(conn, &buf, 1, async_write_complete);
+            if (result != HTTP_SERVER_SUCCESS) {
+                HTTP_LOG_ERROR("Failed to write TLS data: error %d", result);
             }
         }
     }
@@ -723,7 +1481,12 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
     
     if (conn->body_length + length > conn->body_capacity) {
         size_t old_capacity = conn->body_capacity;
-        size_t new_capacity = (conn->body_length + length) * 2;
+        size_t required_size = conn->body_length + length;
+        
+        // Use adaptive buffer sizing
+        size_t new_capacity = adaptive_buffer_size(old_capacity, required_size, 
+                                                   &conn->server->request_buffer_stats);
+        
         char* new_body = http_realloc(conn->server, conn->body, old_capacity, new_capacity);
         if (!new_body) {
             HTTP_LOG_ERROR("Failed to reallocate memory for request body");
@@ -731,6 +1494,10 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
         }
         conn->body = new_body;
         conn->body_capacity = new_capacity;
+        conn->optimal_body_capacity = new_capacity;
+        
+        // Update statistics
+        buffer_stats_update(&conn->server->request_buffer_stats, new_capacity);
     }
     
     memcpy(conn->body + conn->body_length, at, length);
@@ -903,6 +1670,8 @@ static void on_new_connection(uv_stream_t* server, int status) {
     
     conn->server = http_server;
     conn->tls_enabled = http_server->tls_enabled;
+    conn->keep_alive_enabled = 1;  // Enable Keep-Alive by default for HTTP
+    conn->requests_handled = 0;
     
     int init_result = uv_tcp_init(http_server->loop, &conn->tcp);
     if (init_result != 0) {
@@ -937,6 +1706,17 @@ static void on_new_connection(uv_stream_t* server, int status) {
             
             SSL_set_bio(conn->ssl, conn->read_bio, conn->write_bio);
             SSL_set_accept_state(conn->ssl);
+            
+            // Initialize adaptive TLS buffer
+            http_server_error_t tls_init_result = tls_buffer_init(&conn->tls_buffer, TLS_BUFFER_INITIAL_SIZE);
+            if (tls_init_result != HTTP_SERVER_SUCCESS) {
+                HTTP_LOG_ERROR("Failed to initialize TLS buffer");
+                BIO_free(conn->read_bio);
+                BIO_free(conn->write_bio);
+                SSL_free(conn->ssl);
+                free(conn);
+                return;
+            }
         }
         
         // Setup HTTP parser
@@ -1093,6 +1873,27 @@ http_server_t* http_server_create(const http_server_config_t* config) {
     // Initialize memory statistics
     memset(&server->memory_stats, 0, sizeof(memory_stats_t));
     
+    // Initialize adaptive buffer statistics
+    buffer_stats_init(&server->request_buffer_stats);
+    buffer_stats_init(&server->response_buffer_stats);
+    buffer_stats_init(&server->read_buffer_stats);
+    server->default_read_buffer_size = ADAPTIVE_BUFFER_MIN_SIZE;
+    
+    // Initialize async I/O optimization
+    http_server_error_t write_pool_result = write_pool_init(&server->write_pool);
+    if (write_pool_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_ERROR("Failed to initialize write request pool");
+        memory_pool_destroy(&server->connection_pool);
+        memory_pool_destroy(&server->large_pool);
+        memory_pool_destroy(&server->medium_pool);
+        memory_pool_destroy(&server->small_pool);
+        if (server->ssl_ctx) SSL_CTX_free(server->ssl_ctx);
+        free(server);
+        return NULL;
+    }
+    
+    io_stats_init(&server->io_stats);
+    
     uv_tcp_init(server->loop, &server->tcp);
     server->tcp.data = server;
     
@@ -1116,6 +1917,21 @@ int http_server_listen(http_server_t* server) {
         return r;
     }
     
+    // Start memory monitoring
+    http_server_error_t monitor_result = memory_monitoring_start(server);
+    if (monitor_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_WARN("Failed to start memory monitoring, continuing without it");
+    }
+    
+    // Start I/O performance monitoring
+    http_server_error_t io_monitor_result = io_monitoring_start(server);
+    if (io_monitor_result != HTTP_SERVER_SUCCESS) {
+        HTTP_LOG_WARN("Failed to start I/O monitoring, continuing without it");
+    }
+    
+    // Log initial memory state
+    memory_stats_log_detailed(server);
+    
     if (server->tls_enabled) {
         printf("HTTPS server listening on https://0.0.0.0:%d\n", server->port);
     } else {
@@ -1129,9 +1945,20 @@ int http_server_listen(http_server_t* server) {
 void http_server_destroy(http_server_t* server) {
     if (!server) return;
     
-    // Log final memory statistics
-    HTTP_LOG_INFO("Server shutdown - Final memory statistics:");
-    memory_stats_log(&server->memory_stats);
+    // Stop monitoring
+    memory_monitoring_stop(server);
+    io_monitoring_stop(server);
+    
+    // Log final statistics
+    HTTP_LOG_INFO("Server shutdown - Final statistics:");
+    memory_stats_log_detailed(server);
+    io_stats_log(&server->io_stats);
+    
+    // Perform memory leak detection before destroying pools
+    memory_leak_check(server);
+    
+    // Destroy async I/O resources
+    write_pool_destroy(&server->write_pool);
     
     // Destroy memory pools
     memory_pool_destroy(&server->connection_pool);
@@ -1269,21 +2096,28 @@ int http_respond(http_request_t* request, http_response_t* response) {
     // Add safety margin
     required_size += 256;
     
-    // Allocate dynamic buffer
-    char* response_buf = malloc(required_size);
+    // Use adaptive buffer sizing for response
+    size_t optimal_size = adaptive_buffer_size(0, required_size, &conn->server->response_buffer_stats);
+    size_t actual_size = optimal_size > required_size ? optimal_size : required_size;
+    
+    // Allocate dynamic buffer using server's memory management
+    char* response_buf = (char*)http_malloc(conn->server, actual_size);
     if (!response_buf) {
-        fprintf(stderr, "Failed to allocate response buffer of size %zu\n", required_size);
+        HTTP_LOG_ERROR("Failed to allocate response buffer of size %zu", actual_size);
         return -1;
     }
     
+    // Update statistics
+    buffer_stats_update(&conn->server->response_buffer_stats, actual_size);
+    
     int offset = 0;
-    size_t remaining = required_size;
+    size_t remaining = actual_size;
     
     // Status line
     int written = snprintf(response_buf + offset, remaining, 
                           "HTTP/1.1 %d OK\r\n", response->status_code);
     if (written >= (int)remaining) {
-        free(response_buf);
+        http_free(conn->server, response_buf, actual_size);
         return -1;
     }
     offset += written;
@@ -1295,7 +2129,7 @@ int http_respond(http_request_t* request, http_response_t* response) {
             written = snprintf(response_buf + offset, remaining,
                               "%s: %s\r\n", response->headers[i][0], response->headers[i][1]);
             if (written >= (int)remaining) {
-                free(response_buf);
+                http_free(conn->server, response_buf, actual_size);
                 return -1;
             }
             offset += written;
@@ -1308,17 +2142,21 @@ int http_respond(http_request_t* request, http_response_t* response) {
         written = snprintf(response_buf + offset, remaining,
                           "Content-Length: %zu\r\n", response->body_length);
         if (written >= (int)remaining) {
-            free(response_buf);
+            http_free(conn->server, response_buf, actual_size);
             return -1;
         }
         offset += written;
         remaining -= written;
     }
     
-    // Connection close
-    written = snprintf(response_buf + offset, remaining, "Connection: close\r\n");
+    // Connection header (Keep-Alive or Close)
+    const char* connection_header = "Connection: close\r\n";
+    if (conn->keep_alive_enabled && conn->requests_handled < MAX_KEEP_ALIVE_REQUESTS && !conn->tls_enabled) {
+        connection_header = "Connection: keep-alive\r\n";
+    }
+    written = snprintf(response_buf + offset, remaining, "%s", connection_header);
     if (written >= (int)remaining) {
-        free(response_buf);
+        http_free(conn->server, response_buf, actual_size);
         return -1;
     }
     offset += written;
@@ -1327,7 +2165,7 @@ int http_respond(http_request_t* request, http_response_t* response) {
     // End headers
     written = snprintf(response_buf + offset, remaining, "\r\n");
     if (written >= (int)remaining) {
-        free(response_buf);
+        http_free(conn->server, response_buf, actual_size);
         return -1;
     }
     offset += written;
@@ -1336,7 +2174,7 @@ int http_respond(http_request_t* request, http_response_t* response) {
     // Body
     if (response->body) {
         if (response->body_length >= remaining) {
-            free(response_buf);
+            http_free(conn->server, response_buf, actual_size);
             return -1;
         }
         memcpy(response_buf + offset, response->body, response->body_length);
@@ -1344,41 +2182,67 @@ int http_respond(http_request_t* request, http_response_t* response) {
     }
     
     if (conn->tls_enabled) {
-        // Send response via SSL
+        // Send response via SSL (still uses single buffer for SSL compatibility)
         int bytes = SSL_write(conn->ssl, response_buf, offset);
-        free(response_buf);
         
         if (bytes > 0) {
             printf("Sent HTTPS response (%d bytes)\n", bytes);
             SSL_shutdown(conn->ssl);
             conn->shutdown_sent = 1;
             flush_tls_data(conn);
+            
+            // Update I/O statistics
+            io_stats_update_write(&conn->server->io_stats, bytes, 0, 0);
+            
+            http_free(conn->server, response_buf, actual_size);
             return 0;
         } else {
             int err = SSL_get_error(conn->ssl, bytes);
             fprintf(stderr, "SSL_write failed: %d\n", err);
+            http_free(conn->server, response_buf, actual_size);
             return -1;
         }
     } else {
-        // Send response directly via TCP
-        uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
-        if (!req) {
-            fprintf(stderr, "Failed to allocate write request\n");
-            free(response_buf);
-            return -1;
+        // Use optimized vectored write for plain HTTP
+        // Separate headers from body for potential optimization
+        size_t header_len = offset;
+        if (response->body && response->body_length > 0) {
+            header_len = offset - response->body_length;
         }
         
-        uv_buf_t buf = uv_buf_init(response_buf, offset);
+        http_server_error_t result;
+        if (response->body && response->body_length > 0) {
+            // Send headers and body separately using vectored I/O
+            result = async_write_response(conn, response_buf, header_len, 
+                                        response->body, response->body_length,
+                                        async_write_complete);
+        } else {
+            // Headers only
+            uv_buf_t buf = uv_buf_init(response_buf, header_len);
+            result = async_write_vectored(conn, &buf, 1, async_write_complete);
+        }
         
-        int result = uv_write(req, (uv_stream_t*)conn, &buf, 1, on_write);
-        if (result == 0) {
+        if (result == HTTP_SERVER_SUCCESS) {
             printf("Sent HTTP response (%d bytes)\n", offset);
-            conn->shutdown_sent = 1;
+            
+            // Handle connection based on Keep-Alive setting
+            conn->requests_handled++;
+            if (conn->keep_alive_enabled && conn->requests_handled < MAX_KEEP_ALIVE_REQUESTS) {
+                // Keep connection alive for next request
+                conn->shutdown_sent = 0;
+                // Reset parser for next request
+                llhttp_init(&conn->parser, HTTP_REQUEST, &conn->parser_settings);
+                conn->parser.data = conn;
+            } else {
+                // Close connection
+                conn->shutdown_sent = 1;
+            }
+            
+            // Note: response_buf will be freed by async_write_complete
             return 0;
         } else {
-            fprintf(stderr, "uv_write failed: %s\n", uv_strerror(result));
-            free(req);
-            free(response_buf);
+            HTTP_LOG_ERROR("Failed to send HTTP response: error %d", result);
+            http_free(conn->server, response_buf, actual_size);
             return -1;
         }
     }

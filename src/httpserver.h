@@ -74,6 +74,8 @@ void http_response_destroy(http_response_t* response);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
 
 // Constants
 #define MAX_HEADERS 64
@@ -86,6 +88,28 @@ void http_response_destroy(http_response_t* response);
 #define MEMORY_POOL_MEDIUM_COUNT 256
 #define MEMORY_POOL_LARGE_COUNT 64
 #define MEMORY_POOL_CONNECTION_COUNT 128
+
+// Memory monitoring configuration
+#define MEMORY_STATS_LOG_INTERVAL 60000  // 60 seconds in milliseconds
+#define MEMORY_WARNING_THRESHOLD_MB 100  // Warning at 100MB usage
+#define MEMORY_CRITICAL_THRESHOLD_MB 500 // Critical at 500MB usage
+#define MEMORY_POOL_LOW_THRESHOLD 0.8    // Warning when pool 80% full
+
+// Dynamic buffer configuration
+#define ADAPTIVE_BUFFER_MIN_SIZE 512     // Minimum buffer size
+#define ADAPTIVE_BUFFER_MAX_SIZE 65536   // Maximum buffer size
+#define ADAPTIVE_BUFFER_SAMPLES 10       // Number of samples for average calculation
+#define ADAPTIVE_BUFFER_GROWTH_FACTOR 1.5 // Growth factor for adaptive sizing
+#define TLS_BUFFER_INITIAL_SIZE 16384    // Initial TLS buffer size
+#define TLS_BUFFER_MAX_SIZE 131072       // Maximum TLS buffer size
+
+// Async I/O optimization configuration
+#define WRITE_REQUEST_POOL_SIZE 256      // Pre-allocated write request pool size
+#define VECTORED_IO_MAX_BUFFERS 8        // Maximum buffers for vectored I/O
+#define ASYNC_WRITE_BATCH_SIZE 4         // Maximum batched write operations
+#define IO_STATS_UPDATE_INTERVAL 1000    // I/O statistics update interval (ms)
+#define KEEP_ALIVE_TIMEOUT 30000         // Keep-alive timeout in milliseconds
+#define MAX_KEEP_ALIVE_REQUESTS 100      // Maximum requests per connection
 
 // Error codes
 typedef enum {
@@ -179,6 +203,63 @@ typedef struct memory_stats_s {
     size_t pool_misses;
 } memory_stats_t;
 
+// Adaptive buffer statistics
+typedef struct buffer_stats_s {
+    size_t recent_sizes[ADAPTIVE_BUFFER_SAMPLES];
+    size_t sample_count;
+    size_t current_index;
+    size_t average_size;
+    size_t optimal_size;
+    size_t total_allocations;
+    size_t resize_count;
+    time_t last_update;
+} buffer_stats_t;
+
+// TLS buffer management
+typedef struct tls_buffer_s {
+    char* data;
+    size_t size;
+    size_t capacity;
+    size_t optimal_capacity;
+    buffer_stats_t stats;
+} tls_buffer_t;
+
+// Async I/O optimization structures
+typedef struct write_request_s {
+    uv_write_t uv_req;
+    struct http_connection_s* connection;
+    char* buffer;
+    size_t buffer_size;
+    int buffer_count;
+    uv_buf_t bufs[VECTORED_IO_MAX_BUFFERS];
+    int is_pooled;  // 1 if from pool, 0 if malloc'd
+    struct write_request_s* next;  // For pool linked list
+} write_request_t;
+
+// I/O performance statistics
+typedef struct io_stats_s {
+    size_t total_reads;
+    size_t total_writes;
+    size_t bytes_read;
+    size_t bytes_written;
+    size_t vectored_writes;
+    size_t pooled_requests;
+    size_t malloc_requests;
+    size_t syscall_count;
+    double avg_write_size;
+    double avg_batch_size;
+    time_t last_update;
+} io_stats_t;
+
+// Write request pool
+typedef struct write_pool_s {
+    write_request_t* free_list;
+    write_request_t* allocated_requests;
+    size_t allocated_count;
+    size_t free_count;
+    pthread_mutex_t mutex;
+} write_pool_t;
+
 // Internal structures
 struct http_server_s {
     uv_tcp_t tcp;
@@ -194,6 +275,22 @@ struct http_server_s {
     memory_pool_t large_pool;    // 16KB-64KB
     memory_pool_t connection_pool; // Connection structures
     memory_stats_t memory_stats;
+    
+    // Memory monitoring
+    uv_timer_t memory_stats_timer;
+    int memory_monitoring_enabled;
+    
+    // Adaptive buffer management
+    buffer_stats_t request_buffer_stats;  // For request body buffers
+    buffer_stats_t response_buffer_stats; // For response buffers
+    buffer_stats_t read_buffer_stats;     // For network read buffers
+    size_t default_read_buffer_size;      // Current optimal read buffer size
+    
+    // Async I/O optimization
+    write_pool_t write_pool;              // Pre-allocated write request pool
+    io_stats_t io_stats;                  // I/O performance statistics
+    uv_timer_t io_stats_timer;            // Timer for I/O statistics
+    int io_monitoring_enabled;            // I/O monitoring flag
 };
 
 struct http_connection_s {
@@ -216,9 +313,18 @@ struct http_connection_s {
     char* body;
     size_t body_length;
     size_t body_capacity;
+    size_t optimal_body_capacity;  // Adaptive capacity for body buffer
     
     // Response data
     http_response_t* pending_response;
+    
+    // Adaptive TLS buffer
+    tls_buffer_t tls_buffer;
+    
+    // Keep-alive support
+    int keep_alive_enabled;
+    int requests_handled;
+    uv_timer_t keep_alive_timer;
 };
 
 struct http_request_s {
@@ -253,6 +359,55 @@ char* http_strdup(http_server_t* server, const char* str);
 void memory_stats_update_alloc(memory_stats_t* stats, size_t size);
 void memory_stats_update_free(memory_stats_t* stats, size_t size);
 void memory_stats_log(const memory_stats_t* stats);
+
+// Memory monitoring functions
+void memory_stats_log_detailed(const http_server_t* server);
+void memory_stats_check_thresholds(const http_server_t* server);
+void memory_pool_stats_log(const memory_pool_t* pool, const char* pool_name);
+http_server_error_t memory_monitoring_start(http_server_t* server);
+void memory_monitoring_stop(http_server_t* server);
+void memory_leak_check(const http_server_t* server);
+
+// Adaptive buffer management functions
+void buffer_stats_init(buffer_stats_t* stats);
+void buffer_stats_update(buffer_stats_t* stats, size_t size);
+size_t buffer_stats_get_optimal_size(const buffer_stats_t* stats);
+void buffer_stats_log(const buffer_stats_t* stats, const char* buffer_type);
+
+// TLS buffer management functions
+http_server_error_t tls_buffer_init(tls_buffer_t* buffer, size_t initial_size);
+void tls_buffer_destroy(tls_buffer_t* buffer);
+http_server_error_t tls_buffer_ensure_capacity(tls_buffer_t* buffer, size_t required_size);
+http_server_error_t tls_buffer_adaptive_resize(tls_buffer_t* buffer);
+
+// Adaptive sizing functions
+size_t adaptive_buffer_size(size_t current_size, size_t required_size, const buffer_stats_t* stats);
+void adaptive_buffer_update_server_defaults(http_server_t* server);
+size_t adaptive_read_buffer_size(const http_server_t* server, size_t suggested_size);
+
+// Async I/O optimization functions
+http_server_error_t write_pool_init(write_pool_t* pool);
+void write_pool_destroy(write_pool_t* pool);
+write_request_t* write_pool_acquire(write_pool_t* pool);
+void write_pool_release(write_pool_t* pool, write_request_t* req);
+
+// I/O statistics functions
+void io_stats_init(io_stats_t* stats);
+void io_stats_update_read(io_stats_t* stats, size_t bytes);
+void io_stats_update_write(io_stats_t* stats, size_t bytes, int vectored, int pooled);
+void io_stats_log(const io_stats_t* stats);
+http_server_error_t io_monitoring_start(http_server_t* server);
+void io_monitoring_stop(http_server_t* server);
+
+// Optimized I/O functions
+http_server_error_t async_write_vectored(struct http_connection_s* conn, 
+                                        uv_buf_t* bufs, int buf_count,
+                                        uv_write_cb callback);
+http_server_error_t async_write_response(struct http_connection_s* conn,
+                                        const char* headers, size_t header_len,
+                                        const char* body, size_t body_len,
+                                        uv_write_cb callback);
+void async_write_complete(uv_write_t* req, int status);
 
 // Internal function declarations (only in implementation file)
 
